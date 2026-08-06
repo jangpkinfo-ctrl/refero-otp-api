@@ -18,13 +18,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   console.log(`📧 Sending OTP to ${email}: ${otp}`);
+  console.log(`🔑 API Key length: ${BREVO_API_KEY.length}`);
 
   const url = 'https://api.brevo.com/v3/smtp/email';
   const payload = {
     sender: { email: 'noreply@refero.com', name: 'Refero' },
     to: [{ email }],
     subject: 'Your OTP Code',
-    htmlContent: `<h1>${otp}</h1><p>Expires in 5 minutes.</p>`,
+    htmlContent: `
+      <html>
+        <body>
+          <h1 style="color: #6C63FF;">${otp}</h1>
+          <p>This code expires in <strong>5 minutes</strong>.</p>
+        </body>
+      </html>
+    `,
   };
 
   try {
@@ -34,10 +42,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         'Content-Type': 'application/json',
       },
     });
-    console.log(`✅ OTP sent to ${email}`);
+    console.log('✅ Brevo response:', response.status, response.data);
     return res.status(200).json({ success: true });
-  } catch (error) {
-    console.error('❌ Brevo API error:', error.response?.data || error.message);
+  } catch (error: any) {
+    // ✅ Log the FULL Brevo error response
+    console.error('❌ Brevo API error details:');
+    console.error('Status:', error.response?.status);
+    console.error('Data:', JSON.stringify(error.response?.data, null, 2));
+    console.error('Message:', error.message);
+    
     return res.status(500).json({ 
       error: 'Failed to send OTP email',
       details: error.response?.data || error.message 
