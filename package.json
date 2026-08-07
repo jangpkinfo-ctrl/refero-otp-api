@@ -1,15 +1,13 @@
 {
   "name": "refero-otp-api",
   "version": "1.0.0",
-  "description": "OTP email service for Refero app",
-  "scripts": {
-    "build": "echo 'No build needed'"
-  },
+  "scripts": {},
   "dependencies": {
     "axios": "^1.6.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "@vercel/node": "^3.0.0"
   }
 }
