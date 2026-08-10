@@ -2,7 +2,6 @@ import { VercelRequest, VercelResponse } from '@vercel/node';
 import axios from 'axios';
 
 // ─── Provider Configuration ───
-// Only Brevo, Mailgun, and Resend – SendGrid removed
 const PROVIDERS: Record<string, any> = {
   brevo: {
     name: 'Brevo',
@@ -57,6 +56,26 @@ const PROVIDERS: Record<string, any> = {
       to: [to],
       subject,
       html,
+    }),
+    send: async (payload: any, headers: any, url: string) => {
+      return await axios.post(url, payload, { headers, timeout: 10000 });
+    },
+  },
+  // ─── MAILTRAP (NEW) ───
+  mailtrap: {
+    name: 'Mailtrap',
+    url: 'https://send.api.mailtrap.io/api/send',
+    apiKey: process.env.MAILTRAP_API_TOKEN,
+    headers: (key: string) => ({
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+    }),
+    payload: (fromEmail: string, fromName: string, to: string, subject: string, html: string) => ({
+      from: { email: fromEmail, name: fromName },
+      to: [{ email: to }],
+      subject: subject,
+      html: html,
+      category: 'OTP Verification',
     }),
     send: async (payload: any, headers: any, url: string) => {
       return await axios.post(url, payload, { headers, timeout: 10000 });
