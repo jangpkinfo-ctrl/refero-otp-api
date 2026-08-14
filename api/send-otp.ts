@@ -61,7 +61,6 @@ const PROVIDERS: Record<string, any> = {
       return await axios.post(url, payload, { headers, timeout: 10000 });
     },
   },
-  // ─── MAILTRAP (NEW) ───
   mailtrap: {
     name: 'Mailtrap',
     url: 'https://send.api.mailtrap.io/api/send',
