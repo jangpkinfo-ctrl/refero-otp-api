@@ -1,5 +1,5 @@
 import { VercelRequest, VercelResponse } from '@vercel/node';
-const { db } = require('../../lib/firebase/admin');
+const { db } = require('../lib/firebase/admin'); 
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
