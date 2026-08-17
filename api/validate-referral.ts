@@ -1,8 +1,7 @@
 import { VercelRequest, VercelResponse } from '@vercel/node';
 import { initializeApp, getApps } from 'firebase/app';
-import { getFirestore, collection, query, where, getDocs, limit } from 'firebase/firestore';
+import { getFirestore, doc, getDoc } from 'firebase/firestore';
 
-// Firebase client config (public, safe to include here or from env)
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
   authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
@@ -12,8 +11,12 @@ const firebaseConfig = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-// Initialize Firebase (only once)
-const app = !getApps().length ? initializeApp(firebaseConfig) : getApps()[0];
+let app;
+if (getApps().length === 0) {
+  app = initializeApp(firebaseConfig);
+} else {
+  app = getApps()[0];
+}
 const db = getFirestore(app);
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -24,17 +27,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ valid: false, message: 'Referral code required' });
     }
 
-    const q = query(
-      collection(db, 'users'),
-      where('referralCode', '==', code.toUpperCase()),
-      where('isDeleted', '==', false),
-      limit(1)
-    );
-    const snapshot = await getDocs(q);
+    const upperCode = code.toUpperCase();
 
-    return res.status(200).json({ valid: !snapshot.empty });
-  } catch (error) {
-    console.error('Error validating referral:', error);
-    return res.status(500).json({ valid: false, message: 'Server error' });
+    // ✅ Query the public referral_codes collection
+    const docRef = doc(db, 'referral_codes', upperCode);
+    const docSnap = await getDoc(docRef);
+
+    return res.status(200).json({ valid: docSnap.exists() });
+  } catch (error: any) {
+    console.error('❌ Error validating referral:', error.message);
+    return res.status(500).json({ valid: false, message: 'Server error: ' + error.message });
   }
 }
