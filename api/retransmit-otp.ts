@@ -1,17 +1,28 @@
 import { VercelRequest, VercelResponse } from '@vercel/node';
-const { db } = require('../lib/firebase/admin'); 
+import { db } from '../lib/firebase/admin';
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // ─── CORS Headers ───
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Origin', 'https://www.referoglobal.com');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ message: 'Method not allowed' });
   }
 
   try {
     const { email } = req.body;
-
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });
     }
+
+    console.log(`🔄 Retransmit OTP for: ${email}`);
 
     // Find user
     const userSnapshot = await db
@@ -41,13 +52,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         isUsed: false,
       });
 
-    // Send OTP using your existing send-otp logic
+    // Send OTP via your existing send-otp logic
     const otpApiUrl = process.env.NEXT_PUBLIC_OTP_API_URL || 'https://refero-otp-api.vercel.app/api';
-    await fetch(`${otpApiUrl}/send-otp`, {
+    console.log(`📧 Sending retransmit OTP to ${email} via ${otpApiUrl}/send-otp`);
+    
+    const response = await fetch(`${otpApiUrl}/send-otp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, otp }),
     });
+    const result = await response.json();
+    console.log(`📧 Retransmit OTP response:`, result);
 
     return res.status(200).json({ success: true, message: 'OTP resent' });
   } catch (error) {
