@@ -16,35 +16,40 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { fullName, email, password, referralCode } = req.body;
+    // Accept deviceId and deviceModel (optional)
+    const { fullName, email, password, referralCode, deviceId, deviceModel } = req.body;
 
     if (!fullName || !email || !password || !referralCode) {
-      return res.status(400).json({ message: 'All fields are required' });
+      return res.status(400).json({ message: 'All required fields are missing' });
     }
 
-    // Verify referral code exists
-    const referrerSnapshot = await db
-      .collection('users')
-      .where('referralCode', '==', referralCode.toUpperCase())
-      .where('isDeleted', '==', false)
-      .limit(1)
-      .get();
-
-    if (referrerSnapshot.empty) {
+    // 1. Verify the provided referral code exists in the public collection
+    const referrerDocRef = db.collection('referral_codes').doc(referralCode.toUpperCase());
+    const referrerDocSnap = await referrerDocRef.get();
+    if (!referrerDocSnap.exists) {
       return res.status(400).json({ message: 'Invalid referral code' });
     }
+    const referrerData = referrerDocSnap.data();
+    const referrerId = referrerData.userId;
 
-    const referrerDoc = referrerSnapshot.docs[0];
-    const referrerData = referrerDoc.data();
+    // 2. Get the referrer's full user data to compute level, rootId, etc.
+    const referrerUserDoc = await db.collection('users').doc(referrerId).get();
+    if (!referrerUserDoc.exists) {
+      // Fallback: if referrer not found, treat as root
+    }
+    const referrerUserData = referrerUserDoc.data() || {};
+    const referrerLevel = referrerUserData.level ?? 0;
+    const referrerRootId = referrerUserData.rootId ?? referrerId;
+    const referrerDirectCount = referrerUserData.totalDirectReferrals ?? 0;
 
-    // Create Firebase Auth user
+    // 3. Create Firebase Auth user
     const userRecord = await auth.createUser({
       email,
       password,
       displayName: fullName,
     });
 
-    // Generate unique referral code for the new user
+    // 4. Generate unique referral code for the new user
     let userReferralCode = generateReferralCode();
     let codeExists = true;
     let attempts = 0;
@@ -58,56 +63,95 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
-    const referrerLevel = referrerData['level'] ?? 0;
-    const referrerRootId = referrerData['rootId'] ?? referrerDoc.id;
+    // 5. Compute tree values
     const level = referrerLevel + 1;
+    const rootId = referrerRootId;
+    const referralIndex = referrerDirectCount + 1;
 
+    // 6. Depth check (max 10)
     if (level > 10) {
       await auth.deleteUser(userRecord.uid);
       return res.status(400).json({ message: 'Maximum referral depth (10) reached' });
     }
 
-    // Save user to Firestore
-    await db.collection('users').doc(userRecord.uid).set({
+    // 7. Build user document (matching app's UserModel)
+    const now = new Date();
+    const userData = {
       uid: userRecord.uid,
       email,
       fullName,
+      phoneNumber: null,
+      profileImageUrl: null,
       referralCode: userReferralCode,
       referredBy: referralCode.toUpperCase(),
       referralLink: `https://referoglobal.com?ref=${userReferralCode}`,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      deviceId: 'web_registration',
-      deviceModel: 'web',
-      level,
-      rootId: referrerRootId,
-      referralIndex: (referrerData['totalDirectReferrals'] ?? 0) + 1,
-      isActive: true,
-      isDeleted: false,
-      isEmailVerified: false,
       tier: 'free',
       subscriptionStatus: 'inactive',
+      pendingSubscription: null,
+      pendingPlanId: null,
       walletBalance: 0,
       totalEarnings: 0,
       totalDirectReferrals: 0,
       totalNetworkReferrals: 0,
+      paymentMethods: [],
+      deviceId: deviceId || 'web_registration',
+      deviceModel: deviceModel || 'web',
+      isEmailVerified: false,
+      isActive: true,
+      isBanned: false,
+      createdAt: now,
+      updatedAt: now,
+      lastLoginAt: null,
+      fcmToken: null,
+      rejectionReason: null,
+      rejectedAt: null,
+      level,
+      rootId,
+      referralIndex,
+    };
+
+    // 8. Save user to Firestore
+    await db.collection('users').doc(userRecord.uid).set(userData);
+
+    // 9. Create public referral code document (with uppercase ID)
+    await db.collection('referral_codes').doc(userReferralCode.toUpperCase()).set({
+      userId: userRecord.uid,
+      createdAt: now,
     });
 
-    // Update referrer
+    // 10. Update referrer's totalDirectReferrals and add referral history
     await db
       .collection('users')
-      .doc(referrerDoc.id)
+      .doc(referrerId)
+      .update({
+        totalDirectReferrals: admin.firestore.FieldValue.increment(1),
+        updatedAt: now,
+      });
+    await db
+      .collection('users')
+      .doc(referrerId)
       .collection('referralHistory')
       .doc(userRecord.uid)
-      .set(
-        {
-          referredUserId: userRecord.uid,
-          referredAt: new Date(),
-        },
-        { merge: true }
-      );
+      .set({
+        referredUserId: userRecord.uid,
+        referredAt: now,
+      }, { merge: true });
 
-    // Generate OTP
+    // 11. Create placeholder document in earningsHistory (matching app's structure)
+    //    This ensures the subcollection exists and can be queried later.
+    await db
+      .collection('users')
+      .doc(userRecord.uid)
+      .collection('earningsHistory')
+      .doc('_init')
+      .set({
+        type: 'system',
+        amount: 0,
+        description: 'Welcome to Refero!',
+        timestamp: now,
+      });
+
+    // 12. Generate and store OTP (same as before)
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await db
       .collection('users')
@@ -116,12 +160,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .doc('current')
       .set({
         code: otp,
-        createdAt: new Date(),
-        expiresAt: new Date(Date.now() + 5 * 60 * 1000),
+        createdAt: now,
+        expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
         isUsed: false,
       });
 
-    // Send OTP using your existing send-otp logic
+    // 13. Send OTP via your email service
     const otpApiUrl = process.env.NEXT_PUBLIC_OTP_API_URL || 'https://refero-otp-api.vercel.app/api';
     await fetch(`${otpApiUrl}/send-otp`, {
       method: 'POST',
