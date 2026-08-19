@@ -22,37 +22,17 @@ const db = getFirestore(app);
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const { code } = req.query;
-
     if (!code || typeof code !== 'string') {
-      return res.status(400).json({
-        valid: false,
-        message: 'Referral code required',
-        debug: { code: code },
-      });
+      return res.status(400).json({ valid: false, message: 'Referral code required' });
     }
 
     const upperCode = code.toUpperCase();
-
-    // ✅ Query the public referral_codes collection
     const docRef = doc(db, 'referral_codes', upperCode);
     const docSnap = await getDoc(docRef);
 
-    // ✅ Return debug info in the response
-    return res.status(200).json({
-      valid: docSnap.exists(),
-      debug: {
-        originalCode: code,
-        queriedCode: upperCode,
-        documentPath: docRef.path,
-        documentExists: docSnap.exists(),
-        documentData: docSnap.exists() ? docSnap.data() : null,
-      },
-    });
-  } catch (error: any) {
-    return res.status(500).json({
-      valid: false,
-      message: 'Server error: ' + error.message,
-      debug: { error: error.message, stack: error.stack },
-    });
+    return res.status(200).json({ valid: docSnap.exists() });
+  } catch (error) {
+    console.error('Error validating referral:', error);
+    return res.status(500).json({ valid: false, message: 'Server error' });
   }
 }
