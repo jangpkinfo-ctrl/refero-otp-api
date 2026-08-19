@@ -1,5 +1,5 @@
 import { VercelRequest, VercelResponse } from '@vercel/node';
-const { db, auth } = require('../lib/firebase/admin');
+const { db, auth, admin } = require('../lib/firebase/admin');
 
 function generateReferralCode(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -17,7 +17,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
   res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
-  // Handle preflight
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
@@ -33,7 +32,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ message: 'All required fields are missing' });
     }
 
-    // 1. Verify referral code exists (public collection)
+    // 1. Verify referral code exists
     const referrerDocRef = db.collection('referral_codes').doc(referralCode.toUpperCase());
     const referrerDocSnap = await referrerDocRef.get();
     if (!referrerDocSnap.exists) {
@@ -42,7 +41,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const referrerData = referrerDocSnap.data();
     const referrerId = referrerData.userId;
 
-    // 2. Get referrer's full data
+    // 2. Get referrer's data
     const referrerUserDoc = await db.collection('users').doc(referrerId).get();
     if (!referrerUserDoc.exists) {
       // fallback – treat as root if referrer not found
@@ -83,6 +82,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const now = new Date();
+
+    // 5. Save user document
     const userData = {
       uid: userRecord.uid,
       email,
@@ -119,13 +120,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     await db.collection('users').doc(userRecord.uid).set(userData);
 
-    // Create public referral code document
+    // 6. Create referral_codes document
     await db.collection('referral_codes').doc(userReferralCode.toUpperCase()).set({
       userId: userRecord.uid,
       createdAt: now,
     });
 
-    // Update referrer
+    // 7. Update referrer's totalDirectReferrals and add referral history
     await db
       .collection('users')
       .doc(referrerId)
@@ -143,7 +144,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         referredAt: now,
       }, { merge: true });
 
-    // Placeholder earnings history
+    // 8. Placeholder earnings history
     await db
       .collection('users')
       .doc(userRecord.uid)
@@ -156,7 +157,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         timestamp: now,
       });
 
-    // OTP
+    // 9. OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await db
       .collection('users')
@@ -180,6 +181,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).json({ success: true, message: 'User registered' });
   } catch (error: any) {
     console.error('Registration error:', error);
-    return res.status(500).json({ message: error.message || 'Registration failed' });
+    return res.status(500).json({
+      message: 'Registration failed',
+      error: error.message,
+    });
   }
 }
