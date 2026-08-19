@@ -1,38 +1,43 @@
 import { VercelRequest, VercelResponse } from '@vercel/node';
-const { db, auth, admin } = require('../lib/firebase/admin');
 
-function generateReferralCode(): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let code = '';
-  for (let i = 0; i < 8; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)]; 
-  }
-  return code;
-}
-
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // ─── CORS Headers ───
+// ─── CORS Headers ───
+function setCorsHeaders(res: VercelResponse) {
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Origin', 'https://www.referoglobal.com');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
   res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+}
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).json({ message: 'Method not allowed' });
-  }
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  setCorsHeaders(res);
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ message: 'Method not allowed' });
 
   try {
+    // ⚠️ Wrap the require in try-catch to catch import errors
+    let db, auth, admin;
+    try {
+      const adminModule = require('../lib/firebase/admin');
+      db = adminModule.db;
+      auth = adminModule.auth;
+      admin = adminModule.admin;
+      console.log('✅ Admin module loaded successfully');
+    } catch (importError: any) {
+      console.error('❌ Failed to load admin module:', importError);
+      return res.status(500).json({
+        message: 'Server configuration error: admin module missing',
+        error: importError.message,
+        stack: importError.stack,
+      });
+    }
+
     const { fullName, email, password, referralCode, deviceId, deviceModel } = req.body;
 
     if (!fullName || !email || !password || !referralCode) {
       return res.status(400).json({ message: 'All required fields are missing' });
     }
 
-    // 1. Verify referral code exists
+    // ─── 1. Verify referral code exists ───
     const referrerDocRef = db.collection('referral_codes').doc(referralCode.toUpperCase());
     const referrerDocSnap = await referrerDocRef.get();
     if (!referrerDocSnap.exists) {
@@ -41,24 +46,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const referrerData = referrerDocSnap.data();
     const referrerId = referrerData.userId;
 
-    // 2. Get referrer's data
+    // ─── 2. Get referrer's data ───
     const referrerUserDoc = await db.collection('users').doc(referrerId).get();
-    if (!referrerUserDoc.exists) {
-      // fallback – treat as root if referrer not found
-    }
-    const referrerUserData = referrerUserDoc.data() || {};
-    const referrerLevel = referrerUserData.level ?? 0;
-    const referrerRootId = referrerUserData.rootId ?? referrerId;
-    const referrerDirectCount = referrerUserData.totalDirectReferrals ?? 0;
+    const referrerUserData = referrerUserDoc.exists ? referrerUserDoc.data() : {};
+    const referrerLevel = referrerUserData?.level ?? 0;
+    const referrerRootId = referrerUserData?.rootId ?? referrerId;
+    const referrerDirectCount = referrerUserData?.totalDirectReferrals ?? 0;
 
-    // 3. Create Firebase Auth user
+    // ─── 3. Create Firebase Auth user ───
     const userRecord = await auth.createUser({
       email,
       password,
       displayName: fullName,
     });
 
-    // 4. Generate unique referral code for the new user
+    // ─── 4. Generate unique referral code ───
+    function generateReferralCode(): string {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+      let code = '';
+      for (let i = 0; i < 8; i++) {
+        code += chars[Math.floor(Math.random() * chars.length)];
+      }
+      return code;
+    }
+
     let userReferralCode = generateReferralCode();
     let codeExists = true;
     let attempts = 0;
@@ -83,7 +94,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const now = new Date();
 
-    // 5. Save user document
+    // ─── 5. Save user document ───
     const userData = {
       uid: userRecord.uid,
       email,
@@ -120,20 +131,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     await db.collection('users').doc(userRecord.uid).set(userData);
 
-    // 6. Create referral_codes document
+    // ─── 6. Create referral_codes document ───
     await db.collection('referral_codes').doc(userReferralCode.toUpperCase()).set({
       userId: userRecord.uid,
       createdAt: now,
     });
 
-    // 7. Update referrer's totalDirectReferrals and add referral history
-    await db
-      .collection('users')
-      .doc(referrerId)
-      .update({
-        totalDirectReferrals: admin.firestore.FieldValue.increment(1),
-        updatedAt: now,
-      });
+    // ─── 7. Update referrer ───
+    await db.collection('users').doc(referrerId).update({
+      totalDirectReferrals: admin.firestore.FieldValue.increment(1),
+      updatedAt: now,
+    });
     await db
       .collection('users')
       .doc(referrerId)
@@ -144,7 +152,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         referredAt: now,
       }, { merge: true });
 
-    // 8. Placeholder earnings history
+    // ─── 8. Placeholder earningsHistory ───
     await db
       .collection('users')
       .doc(userRecord.uid)
@@ -157,7 +165,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         timestamp: now,
       });
 
-    // 9. OTP
+    // ─── 9. OTP ───
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await db
       .collection('users')
@@ -179,11 +187,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
     return res.status(200).json({ success: true, message: 'User registered' });
+
   } catch (error: any) {
-    console.error('Registration error:', error);
+    console.error('❌ Registration error:', error);
     return res.status(500).json({
       message: 'Registration failed',
       error: error.message,
+      stack: error.stack,
     });
   }
 }
