@@ -27,23 +27,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ message: 'All required fields are missing' });
     }
 
-    // ─── 1. Verify referral code ───
-    const referrerDocRef = db.collection('referral_codes').doc(referralCode.toUpperCase());
-    const referrerDocSnap = await referrerDocRef.get();
-    if (!referrerDocSnap.exists) {
-      return res.status(400).json({ message: 'Invalid referral code' });
+    console.log('📥 Register request:', { email, referralCode, passwordLength: password?.length });
+
+    // ─── STEP 1: Verify referral code ───
+    let referrerId;
+    try {
+      const referrerDocRef = db.collection('referral_codes').doc(referralCode.toUpperCase());
+      const referrerDocSnap = await referrerDocRef.get();
+      if (!referrerDocSnap.exists) {
+        return res.status(400).json({ message: 'Invalid referral code' });
+      }
+      referrerId = referrerDocSnap.data().userId;
+    } catch (err: any) {
+      return res.status(500).json({ step: 'verify_referral', error: err.message });
     }
-    const referrerData = referrerDocSnap.data();
-    const referrerId = referrerData.userId;
 
-    // ─── 2. Get referrer's data ───
-    const referrerUserDoc = await db.collection('users').doc(referrerId).get();
-    const referrerUserData = referrerUserDoc.exists ? referrerUserDoc.data() : {};
-    const referrerLevel = referrerUserData?.level ?? 0;
-    const referrerRootId = referrerUserData?.rootId ?? referrerId;
-    const referrerDirectCount = referrerUserData?.totalDirectReferrals ?? 0;
+    // ─── STEP 2: Get referrer data ───
+    let referrerLevel = 0, referrerRootId = referrerId, referrerDirectCount = 0;
+    try {
+      const referrerUserDoc = await db.collection('users').doc(referrerId).get();
+      if (referrerUserDoc.exists) {
+        const data = referrerUserDoc.data();
+        referrerLevel = data?.level ?? 0;
+        referrerRootId = data?.rootId ?? referrerId;
+        referrerDirectCount = data?.totalDirectReferrals ?? 0;
+      }
+    } catch (err: any) {
+      return res.status(500).json({ step: 'get_referrer_data', error: err.message });
+    }
 
-    // ─── 3. Create Firebase Auth user ───
+    // ─── STEP 3: Create Firebase Auth user ───
     let userRecord;
     try {
       userRecord = await auth.createUser({
@@ -51,17 +64,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         password,
         displayName: fullName,
       });
+      console.log('✅ Auth user created:', userRecord.uid);
     } catch (authError: any) {
-      console.error('auth.createUser error:', authError);
+      console.error('❌ auth.createUser error:', authError);
       return res.status(500).json({
-        message: 'Failed to create Firebase Auth user',
+        step: 'auth_create_user',
         error: authError.message,
         code: authError.code,
-        details: authError,
+        fullError: authError,
       });
     }
 
-    // ─── 4. Generate unique referral code ───
+    // ─── STEP 4: Generate referral code ───
     let userReferralCode = generateReferralCode();
     let codeExists = true;
     let attempts = 0;
@@ -86,101 +100,104 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const now = new Date();
 
-    // ─── 5. Save user to Firestore ───
-    const userData = {
-      uid: userRecord.uid,
-      email,
-      fullName,
-      phoneNumber: null,
-      profileImageUrl: null,
-      referralCode: userReferralCode,
-      referredBy: referralCode.toUpperCase(),
-      referralLink: `https://referoglobal.com?ref=${userReferralCode}`,
-      tier: 'free',
-      subscriptionStatus: 'inactive',
-      pendingSubscription: null,
-      pendingPlanId: null,
-      walletBalance: 0,
-      totalEarnings: 0,
-      totalDirectReferrals: 0,
-      totalNetworkReferrals: 0,
-      paymentMethods: [],
-      deviceId: deviceId || 'web_registration',
-      deviceModel: deviceModel || 'web',
-      isEmailVerified: false,
-      isActive: true,
-      isBanned: false,
-      createdAt: now,
-      updatedAt: now,
-      lastLoginAt: null,
-      fcmToken: null,
-      rejectionReason: null,
-      rejectedAt: null,
-      level,
-      rootId,
-      referralIndex,
-    };
-
-    await db.collection('users').doc(userRecord.uid).set(userData);
-
-    // ─── 6. Create referral_codes document ───
-    await db.collection('referral_codes').doc(userReferralCode.toUpperCase()).set({
-      userId: userRecord.uid,
-      createdAt: now,
-    });
-
-    // ─── 7. Update referrer ───
-    await db.collection('users').doc(referrerId).update({
-      totalDirectReferrals: admin.firestore.FieldValue.increment(1),
-      updatedAt: now,
-    });
-    await db
-      .collection('users')
-      .doc(referrerId)
-      .collection('referralHistory')
-      .doc(userRecord.uid)
-      .set({
-        referredUserId: userRecord.uid,
-        referredAt: now,
-      }, { merge: true });
-
-    // ─── 8. Earnings history placeholder ───
-    await db
-      .collection('users')
-      .doc(userRecord.uid)
-      .collection('earningsHistory')
-      .doc('_init')
-      .set({
-        type: 'system',
-        amount: 0,
-        description: 'Welcome to Refero!',
-        timestamp: now,
-      });
-
-    // ─── 9. OTP ───
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    await db
-      .collection('users')
-      .doc(userRecord.uid)
-      .collection('otp')
-      .doc('current')
-      .set({
-        code: otp,
+    // ─── STEP 5: Save user to Firestore ───
+    try {
+      const userData = {
+        uid: userRecord.uid,
+        email,
+        fullName,
+        phoneNumber: null,
+        profileImageUrl: null,
+        referralCode: userReferralCode,
+        referredBy: referralCode.toUpperCase(),
+        referralLink: `https://referoglobal.com?ref=${userReferralCode}`,
+        tier: 'free',
+        subscriptionStatus: 'inactive',
+        pendingSubscription: null,
+        pendingPlanId: null,
+        walletBalance: 0,
+        totalEarnings: 0,
+        totalDirectReferrals: 0,
+        totalNetworkReferrals: 0,
+        paymentMethods: [],
+        deviceId: deviceId || 'web_registration',
+        deviceModel: deviceModel || 'web',
+        isEmailVerified: false,
+        isActive: true,
+        isBanned: false,
         createdAt: now,
-        expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
-        isUsed: false,
-      });
+        updatedAt: now,
+        lastLoginAt: null,
+        fcmToken: null,
+        rejectionReason: null,
+        rejectedAt: null,
+        level,
+        rootId,
+        referralIndex,
+      };
+      await db.collection('users').doc(userRecord.uid).set(userData);
+    } catch (err: any) {
+      return res.status(500).json({ step: 'save_user', error: err.message });
+    }
 
-    const otpApiUrl = process.env.NEXT_PUBLIC_OTP_API_URL || 'https://refero-otp-api.vercel.app/api';
-    await fetch(`${otpApiUrl}/send-otp`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, otp }),
-    });
+    // ─── STEP 6: Create referral_codes ───
+    try {
+      await db.collection('referral_codes').doc(userReferralCode.toUpperCase()).set({
+        userId: userRecord.uid,
+        createdAt: now,
+      });
+    } catch (err: any) {
+      // Non-critical – continue
+      console.warn('referral_codes write failed:', err.message);
+    }
+
+    // ─── STEP 7: Update referrer ───
+    try {
+      await db.collection('users').doc(referrerId).update({
+        totalDirectReferrals: admin.firestore.FieldValue.increment(1),
+        updatedAt: now,
+      });
+      await db
+        .collection('users')
+        .doc(referrerId)
+        .collection('referralHistory')
+        .doc(userRecord.uid)
+        .set({
+          referredUserId: userRecord.uid,
+          referredAt: now,
+        }, { merge: true });
+    } catch (err: any) {
+      console.warn('Referrer update failed:', err.message);
+    }
+
+    // ─── STEP 8: OTP ───
+    try {
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      await db
+        .collection('users')
+        .doc(userRecord.uid)
+        .collection('otp')
+        .doc('current')
+        .set({
+          code: otp,
+          createdAt: now,
+          expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
+          isUsed: false,
+        });
+
+      const otpApiUrl = process.env.NEXT_PUBLIC_OTP_API_URL || 'https://refero-otp-api.vercel.app/api';
+      await fetch(`${otpApiUrl}/send-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, otp }),
+      });
+    } catch (err: any) {
+      console.warn('OTP error:', err.message);
+    }
 
     return res.status(200).json({ success: true, message: 'User registered' });
   } catch (error: any) {
-    console.error('❌ Registration error:', error);
+    console.error('❌ Unhandled error:', error);
     return res.status(500).json({
       message: 'Registration failed',
       error: error.message,
