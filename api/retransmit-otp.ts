@@ -1,5 +1,6 @@
 import { VercelRequest, VercelResponse } from '@vercel/node';
-import { db } from '../lib/firebase/admin';
+// Use require to avoid TypeScript declaration issues
+const { db } = require('../lib/firebase/admin');
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // ─── CORS Headers ───
@@ -21,8 +22,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!email) {
       return res.status(400).json({ message: 'Email is required' });
     }
-
-    console.log(`🔄 Retransmit OTP for: ${email}`);
 
     // Find user
     const userSnapshot = await db
@@ -52,17 +51,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         isUsed: false,
       });
 
-    // Send OTP via your existing send-otp logic
+    // Send OTP using your existing send-otp logic
     const otpApiUrl = process.env.NEXT_PUBLIC_OTP_API_URL || 'https://refero-otp-api.vercel.app/api';
-    console.log(`📧 Sending retransmit OTP to ${email} via ${otpApiUrl}/send-otp`);
-    
-    const response = await fetch(`${otpApiUrl}/send-otp`, {
+    await fetch(`${otpApiUrl}/send-otp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, otp }),
     });
-    const result = await response.json();
-    console.log(`📧 Retransmit OTP response:`, result);
 
     return res.status(200).json({ success: true, message: 'OTP resent' });
   } catch (error) {
