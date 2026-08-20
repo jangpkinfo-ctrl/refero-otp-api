@@ -1,7 +1,17 @@
 import { VercelRequest, VercelResponse } from '@vercel/node';
+const { db, auth, admin } = require('../lib/firebase/admin');
+
+function generateReferralCode(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let code = '';
+  for (let i = 0; i < 8; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // ─── CORS Headers ───
+  // CORS
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Origin', 'https://www.referoglobal.com');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -11,58 +21,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') return res.status(405).json({ message: 'Method not allowed' });
 
   try {
-    // ─── 0. Load Firebase Admin module ───
-    let db, auth, admin;
-    try {
-      const adminModule = require('../lib/firebase/admin');
-      db = adminModule.db;
-      auth = adminModule.auth;
-      admin = adminModule.admin;
-      console.log('✅ Admin module loaded');
-    } catch (importError: any) {
-      console.error('❌ Import error:', importError);
-      return res.status(500).json({
-        message: 'Failed to load Firebase Admin',
-        error: importError.message,
-        stack: importError.stack,
-      });
-    }
-
     const { fullName, email, password, referralCode, deviceId, deviceModel } = req.body;
+
     if (!fullName || !email || !password || !referralCode) {
       return res.status(400).json({ message: 'All required fields are missing' });
     }
 
     // ─── 1. Verify referral code ───
-    let referrerId;
-    try {
-      const referrerDocRef = db.collection('referral_codes').doc(referralCode.toUpperCase());
-      const referrerDocSnap = await referrerDocRef.get();
-      if (!referrerDocSnap.exists) {
-        return res.status(400).json({ message: 'Invalid referral code' });
-      }
-      referrerId = referrerDocSnap.data().userId;
-      console.log('✅ Referral code verified, referrerId:', referrerId);
-    } catch (refError: any) {
-      console.error('❌ Referral verification error:', refError);
-      return res.status(500).json({ message: 'Referral verification failed', error: refError.message });
+    const referrerDocRef = db.collection('referral_codes').doc(referralCode.toUpperCase());
+    const referrerDocSnap = await referrerDocRef.get();
+    if (!referrerDocSnap.exists) {
+      return res.status(400).json({ message: 'Invalid referral code' });
     }
+    const referrerData = referrerDocSnap.data();
+    const referrerId = referrerData.userId;
 
     // ─── 2. Get referrer's data ───
-    let referrerLevel = 0, referrerRootId = referrerId, referrerDirectCount = 0;
-    try {
-      const referrerUserDoc = await db.collection('users').doc(referrerId).get();
-      if (referrerUserDoc.exists) {
-        const data = referrerUserDoc.data();
-        referrerLevel = data?.level ?? 0;
-        referrerRootId = data?.rootId ?? referrerId;
-        referrerDirectCount = data?.totalDirectReferrals ?? 0;
-      }
-      console.log('✅ Referrer data fetched');
-    } catch (refDataError: any) {
-      console.error('❌ Referrer data error:', refDataError);
-      return res.status(500).json({ message: 'Failed to fetch referrer data', error: refDataError.message });
-    }
+    const referrerUserDoc = await db.collection('users').doc(referrerId).get();
+    const referrerUserData = referrerUserDoc.exists ? referrerUserDoc.data() : {};
+    const referrerLevel = referrerUserData?.level ?? 0;
+    const referrerRootId = referrerUserData?.rootId ?? referrerId;
+    const referrerDirectCount = referrerUserData?.totalDirectReferrals ?? 0;
 
     // ─── 3. Create Firebase Auth user ───
     let userRecord;
@@ -72,26 +51,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         password,
         displayName: fullName,
       });
-      console.log('✅ Auth user created:', userRecord.uid);
     } catch (authError: any) {
-      console.error('❌ Auth createUser error:', authError);
+      console.error('auth.createUser error:', authError);
       return res.status(500).json({
         message: 'Failed to create Firebase Auth user',
         error: authError.message,
         code: authError.code,
+        details: authError,
       });
     }
 
     // ─── 4. Generate unique referral code ───
-    function generateReferralCode(): string {
-      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-      let code = '';
-      for (let i = 0; i < 8; i++) {
-        code += chars[Math.floor(Math.random() * chars.length)];
-      }
-      return code;
-    }
-
     let userReferralCode = generateReferralCode();
     let codeExists = true;
     let attempts = 0;
@@ -117,136 +87,100 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const now = new Date();
 
     // ─── 5. Save user to Firestore ───
-    try {
-      const userData = {
-        uid: userRecord.uid,
-        email,
-        fullName,
-        phoneNumber: null,
-        profileImageUrl: null,
-        referralCode: userReferralCode,
-        referredBy: referralCode.toUpperCase(),
-        referralLink: `https://referoglobal.com?ref=${userReferralCode}`,
-        tier: 'free',
-        subscriptionStatus: 'inactive',
-        pendingSubscription: null,
-        pendingPlanId: null,
-        walletBalance: 0,
-        totalEarnings: 0,
-        totalDirectReferrals: 0,
-        totalNetworkReferrals: 0,
-        paymentMethods: [],
-        deviceId: deviceId || 'web_registration',
-        deviceModel: deviceModel || 'web',
-        isEmailVerified: false,
-        isActive: true,
-        isBanned: false,
-        createdAt: now,
-        updatedAt: now,
-        lastLoginAt: null,
-        fcmToken: null,
-        rejectionReason: null,
-        rejectedAt: null,
-        level,
-        rootId,
-        referralIndex,
-      };
-      await db.collection('users').doc(userRecord.uid).set(userData);
-      console.log('✅ User document saved');
-    } catch (saveError: any) {
-      console.error('❌ Firestore save error:', saveError);
-      return res.status(500).json({ message: 'Failed to save user', error: saveError.message });
-    }
+    const userData = {
+      uid: userRecord.uid,
+      email,
+      fullName,
+      phoneNumber: null,
+      profileImageUrl: null,
+      referralCode: userReferralCode,
+      referredBy: referralCode.toUpperCase(),
+      referralLink: `https://referoglobal.com?ref=${userReferralCode}`,
+      tier: 'free',
+      subscriptionStatus: 'inactive',
+      pendingSubscription: null,
+      pendingPlanId: null,
+      walletBalance: 0,
+      totalEarnings: 0,
+      totalDirectReferrals: 0,
+      totalNetworkReferrals: 0,
+      paymentMethods: [],
+      deviceId: deviceId || 'web_registration',
+      deviceModel: deviceModel || 'web',
+      isEmailVerified: false,
+      isActive: true,
+      isBanned: false,
+      createdAt: now,
+      updatedAt: now,
+      lastLoginAt: null,
+      fcmToken: null,
+      rejectionReason: null,
+      rejectedAt: null,
+      level,
+      rootId,
+      referralIndex,
+    };
+
+    await db.collection('users').doc(userRecord.uid).set(userData);
 
     // ─── 6. Create referral_codes document ───
-    try {
-      await db.collection('referral_codes').doc(userReferralCode.toUpperCase()).set({
-        userId: userRecord.uid,
-        createdAt: now,
-      });
-      console.log('✅ referral_codes document created');
-    } catch (refCodeError: any) {
-      console.error('❌ referral_codes error:', refCodeError);
-      // Continue anyway – it's not critical for OTP, but we should log it.
-    }
+    await db.collection('referral_codes').doc(userReferralCode.toUpperCase()).set({
+      userId: userRecord.uid,
+      createdAt: now,
+    });
 
     // ─── 7. Update referrer ───
-    try {
-      await db.collection('users').doc(referrerId).update({
-        totalDirectReferrals: admin.firestore.FieldValue.increment(1),
-        updatedAt: now,
-      });
-      await db
-        .collection('users')
-        .doc(referrerId)
-        .collection('referralHistory')
-        .doc(userRecord.uid)
-        .set({
-          referredUserId: userRecord.uid,
-          referredAt: now,
-        }, { merge: true });
-      console.log('✅ Referrer updated');
-    } catch (updateError: any) {
-      console.error('❌ Referrer update error:', updateError);
-      // Non-critical, continue.
-    }
+    await db.collection('users').doc(referrerId).update({
+      totalDirectReferrals: admin.firestore.FieldValue.increment(1),
+      updatedAt: now,
+    });
+    await db
+      .collection('users')
+      .doc(referrerId)
+      .collection('referralHistory')
+      .doc(userRecord.uid)
+      .set({
+        referredUserId: userRecord.uid,
+        referredAt: now,
+      }, { merge: true });
 
     // ─── 8. Earnings history placeholder ───
-    try {
-      await db
-        .collection('users')
-        .doc(userRecord.uid)
-        .collection('earningsHistory')
-        .doc('_init')
-        .set({
-          type: 'system',
-          amount: 0,
-          description: 'Welcome to Refero!',
-          timestamp: now,
-        });
-      console.log('✅ EarningsHistory placeholder created');
-    } catch (earningsError: any) {
-      console.error('❌ EarningsHistory error:', earningsError);
-      // Non-critical.
-    }
+    await db
+      .collection('users')
+      .doc(userRecord.uid)
+      .collection('earningsHistory')
+      .doc('_init')
+      .set({
+        type: 'system',
+        amount: 0,
+        description: 'Welcome to Refero!',
+        timestamp: now,
+      });
 
     // ─── 9. OTP ───
-    try {
-      const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      await db
-        .collection('users')
-        .doc(userRecord.uid)
-        .collection('otp')
-        .doc('current')
-        .set({
-          code: otp,
-          createdAt: now,
-          expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
-          isUsed: false,
-        });
-
-      const otpApiUrl = process.env.NEXT_PUBLIC_OTP_API_URL || 'https://refero-otp-api.vercel.app/api';
-      console.log(`📧 Sending OTP to ${email} via ${otpApiUrl}/send-otp`);
-      
-      const otpResponse = await fetch(`${otpApiUrl}/send-otp`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, otp }),
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    await db
+      .collection('users')
+      .doc(userRecord.uid)
+      .collection('otp')
+      .doc('current')
+      .set({
+        code: otp,
+        createdAt: now,
+        expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
+        isUsed: false,
       });
-      const otpResult = await otpResponse.json();
-      console.log(`📧 OTP response:`, otpResult);
-      if (!otpResult.success) {
-        console.warn('⚠️ OTP sending reported failure:', otpResult);
-      }
-    } catch (otpError: any) {
-      console.error('❌ OTP error:', otpError);
-      // We still return success because user is created, but log the error.
-      // Optionally, you can return an error here.
-    }
+
+    const otpApiUrl = process.env.NEXT_PUBLIC_OTP_API_URL || 'https://refero-otp-api.vercel.app/api';
+    await fetch(`${otpApiUrl}/send-otp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, otp }),
+    });
 
     return res.status(200).json({ success: true, message: 'User registered' });
   } catch (error: any) {
-    console.error('❌ Unhandled registration error:', error);
+    console.error('❌ Registration error:', error);
     return res.status(500).json({
       message: 'Registration failed',
       error: error.message,
