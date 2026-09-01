@@ -1,14 +1,19 @@
 import { VercelRequest, VercelResponse } from '@vercel/node';
+// ✅ Import Firebase Admin
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { admin, db } = require('../lib/firebase/admin');
 import axios from 'axios';
+// ✅ Import the professional email template
+import { getProfessionalOTPHtml } from '../lib/email-templates/otp-template';
 
-// ─── Provider Configuration ───
+// ─── Provider Configuration ──────────────────────────────────────
 const PROVIDERS: Record<string, any> = {
   brevo: {
     name: 'Brevo',
     url: 'https://api.brevo.com/v3/smtp/email',
     apiKey: process.env.BREVO_API_KEY,
     headers: (key: string) => ({ 
-      'api-key': key, 
+      'api-key': key,  
       'Content-Type': 'application/json' 
     }),
     payload: (fromEmail: string, fromName: string, to: string, subject: string, html: string) => ({
@@ -82,71 +87,101 @@ const PROVIDERS: Record<string, any> = {
   },
 };
 
-// ─── Default HTML Template ───
-function getDefaultOTPHtml(otp: string, year: number): string {
-  return `
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      </head>
-      <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f9f9f9;">
-        <div style="background-color: #ffffff; padding: 30px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
-          <h2 style="color: #1a1a2e; text-align: center; margin-bottom: 20px;">🔐 Your OTP Code</h2>
-          <div style="background: #f0f0ff; padding: 20px; border-radius: 8px; text-align: center; border: 2px dashed #6C63FF;">
-            <h1 style="font-size: 48px; letter-spacing: 10px; color: #6C63FF; margin: 0; font-weight: bold;">
-              ${otp}
-            </h1>
-          </div>
-          <p style="margin-top: 20px; text-align: center; color: #555;">
-            This code expires in <strong>5 minutes</strong>.
-          </p>
-          <p style="text-align: center; color: #888; font-size: 14px;">
-            If you did not request this, please ignore this email.
-          </p>
-          <hr style="margin-top: 30px; border: 0; border-top: 1px solid #eee;">
-          <p style="font-size: 12px; color: #aaa; text-align: center;">
-            Refero • ${year} • Built with ❤️
-          </p>
-        </div>
-      </body>
-    </html>
-  `;
-}
-
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // ✅ Only allow POST requests
+  // ─── CORS ──────────────────────────────────────────────────────
+  const allowedOrigins = [
+    'https://www.referoglobal.com',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:5174',
+  ];
+  const origin = req.headers.origin || '';
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', 'https://www.referoglobal.com');
+  }
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
+  );
+
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed. Use POST.' });
   }
 
-  // ✅ Validate request body
+  // ─── Validate request ─────────────────────────────────────────
   const { email, otp, htmlContent, provider: requestedProvider } = req.body;
 
   if (!email || !otp) {
     return res.status(400).json({ error: 'Email and OTP are required' });
   }
 
-  // ✅ Validate email format
   if (!email.includes('@') || !email.includes('.')) {
     return res.status(400).json({ error: 'Invalid email format' });
   }
 
-  // ✅ Validate OTP format (6 digits)
   if (!/^\d{6}$/.test(otp)) {
     return res.status(400).json({ error: 'OTP must be a 6-digit number' });
   }
 
+  // ─── Find user by email ──────────────────────────────────────
+  let userId: string | null = null;
+  try {
+    const userSnapshot = await db
+      .collection('users')
+      .where('email', '==', email)
+      .limit(1)
+      .get();
+
+    if (userSnapshot.empty) {
+      console.log(`❌ User not found for email: ${email}`);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    userId = userSnapshot.docs[0].id;
+    console.log(`👤 Found user UID: ${userId}`);
+  } catch (error) {
+    console.error('❌ Error finding user:', error);
+    return res.status(500).json({ error: 'Failed to find user' });
+  }
+
+  // ─── Store OTP in Firestore ──────────────────────────────────
+  try {
+    const now = new Date();
+    await db
+      .collection('users')
+      .doc(userId)
+      .collection('otp')
+      .doc('current')
+      .set({
+        code: otp,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
+        isUsed: false,
+      });
+    console.log(`✅ OTP stored in Firestore for user ${userId}`);
+  } catch (error) {
+    console.error('❌ Error storing OTP:', error);
+    return res.status(500).json({ error: 'Failed to store OTP' });
+  }
+
+  // ─── Send email ──────────────────────────────────────────────
   const fromEmail = process.env.FROM_EMAIL || 'noreply@referoglobal.com';
   const fromName = process.env.FROM_NAME || 'Refero';
-  const subject = 'Your OTP Code for Refero';
-  const year = new Date().getFullYear();
+  const subject = '🔐 Your OTP Code for Refero';
 
-  // Use provided HTML or default template
-  const html = htmlContent || getDefaultOTPHtml(otp, year);
+  // ✅ Use the professional template – allow override via htmlContent
+  const html = htmlContent || getProfessionalOTPHtml(otp);
 
-  // ─── Get active providers (only those with API keys) ───
+  // ─── Get active providers ─────────────────────────────────────
   const activeProviders = Object.keys(PROVIDERS).filter((key) => {
     const p = PROVIDERS[key];
     return p.apiKey && p.apiKey.length > 0;
@@ -161,7 +196,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   console.log(`📧 Active providers: ${activeProviders.join(', ')}`);
 
-  // ─── Provider order: requested first, then fallback ───
+  // ─── Provider order: requested first, then fallback ──────────
   let providerList = activeProviders;
   if (requestedProvider && activeProviders.includes(requestedProvider)) {
     providerList = [
@@ -172,7 +207,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   let lastError: any = null;
 
-  // ─── Try each provider in order ───
+  // ─── Try each provider ──────────────────────────────────────
   for (const providerKey of providerList) {
     const provider = PROVIDERS[providerKey];
     
