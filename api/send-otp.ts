@@ -6,7 +6,7 @@ import axios from 'axios';
 // ✅ Import the professional email template
 import { getProfessionalOTPHtml } from '../lib/email-templates/otp-template';
 
-// ─── Provider Configuration ──────────────────────────────────────
+// ─── Provider Configuration ────────────────────────────────────── 
 const PROVIDERS: Record<string, any> = {
   brevo: {
     name: 'Brevo',
