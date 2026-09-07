@@ -189,7 +189,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         timestamp: now,
       });
 
-    // ─── Generate and send OTP ──────────────────────────────────
+    // ─── Store OTP (but DO NOT send email) ──────────────────────
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await db
       .collection('users')
@@ -203,15 +203,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         isUsed: false,
       });
 
-    const otpApiUrl = process.env.NEXT_PUBLIC_OTP_API_URL || 'https://refero-otp-api.vercel.app/api';
-    await fetch(`${otpApiUrl}/send-otp`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, otp }),
-    });
+    // ❌ REMOVED: The fetch call to send-otp – no email sent here
+    // The OTP screen will send the email when it loads.
 
     console.log(`✅ Registration successful for ${email}`);
-    return res.status(200).json({ success: true, message: 'User registered' });
+    return res.status(200).json({ 
+      success: true, 
+      message: 'User registered. Check your email for OTP.' 
+    });
   } catch (error: any) {
     console.error('❌ Unhandled error:', error);
     return res.status(500).json({ message: 'Registration failed', error: error.message, stack: error.stack });
