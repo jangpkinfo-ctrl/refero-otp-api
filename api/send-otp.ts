@@ -16,11 +16,12 @@ const PROVIDERS: Record<string, any> = {
       'api-key': key,  
       'Content-Type': 'application/json' 
     }),
-    payload: (fromEmail: string, fromName: string, to: string, subject: string, html: string) => ({
+    payload: (fromEmail: string, fromName: string, to: string, subject: string, html: string, otp: string) => ({
       sender: { email: fromEmail, name: fromName },
       to: [{ email: to }],
       subject,
       htmlContent: html,
+      textContent: `Your OTP code is: ${otp}\nIt expires in 5 minutes.\n\nIf you did not request this, please ignore this email.`,
     }),
     send: async (payload: any, headers: any, url: string) => {
       return await axios.post(url, payload, { headers, timeout: 10000 });
@@ -35,7 +36,7 @@ const PROVIDERS: Record<string, any> = {
       Authorization: 'Basic ' + Buffer.from(`api:${key}`).toString('base64'),
       'Content-Type': 'application/x-www-form-urlencoded',
     }),
-    payload: (fromEmail: string, fromName: string, to: string, subject: string, html: string) => {
+    payload: (fromEmail: string, fromName: string, to: string, subject: string, html: string, otp: string) => {
       const params = new URLSearchParams({
         from: `${fromName} <${fromEmail}>`,
         to,
@@ -56,7 +57,7 @@ const PROVIDERS: Record<string, any> = {
       Authorization: `Bearer ${key}`, 
       'Content-Type': 'application/json' 
     }),
-    payload: (fromEmail: string, fromName: string, to: string, subject: string, html: string) => ({
+    payload: (fromEmail: string, fromName: string, to: string, subject: string, html: string, otp: string) => ({
       from: `${fromName} <${fromEmail}>`,
       to: [to],
       subject,
@@ -74,7 +75,7 @@ const PROVIDERS: Record<string, any> = {
       Authorization: `Bearer ${key}`,
       'Content-Type': 'application/json',
     }),
-    payload: (fromEmail: string, fromName: string, to: string, subject: string, html: string) => ({
+    payload: (fromEmail: string, fromName: string, to: string, subject: string, html: string, otp: string) => ({
       from: { email: fromEmail, name: fromName },
       to: [{ email: to }],
       subject: subject,
@@ -153,6 +154,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: 'Failed to find user' });
   }
 
+  // ─── Cooldown: Prevent rapid OTP requests ─────────────────────
+  try {
+    const otpDoc = await db
+      .collection('users')
+      .doc(userId)
+      .collection('otp')
+      .doc('current')
+      .get();
+
+    if (otpDoc.exists) {
+      const data = otpDoc.data();
+      const createdAt = data?.createdAt?.toDate?.() || new Date(0);
+      const seconds = (Date.now() - createdAt.getTime()) / 1000;
+      if (seconds < 30) {
+        console.log(`⏳ Cooldown: ${30 - seconds}s remaining for user ${userId}`);
+        return res.status(429).json({ 
+          error: `Please wait ${Math.ceil(30 - seconds)} seconds before requesting another OTP.` 
+        });
+      }
+    }
+  } catch (error) {
+    console.warn('⚠️ Cooldown check failed:', error);
+    // Continue anyway – don't block on cooldown error
+  }
+
   // ─── Store OTP in Firestore ──────────────────────────────────
   try {
     const now = new Date();
@@ -218,7 +244,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         ? provider.url(provider.domain || '')
         : provider.url;
 
-      const payload = provider.payload(fromEmail, fromName, email, subject, html);
+      const payload = provider.payload(fromEmail, fromName, email, subject, html, otp);
       const headers = provider.headers(provider.apiKey);
 
       const response = await provider.send(payload, headers, url);
