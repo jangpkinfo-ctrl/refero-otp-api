@@ -6,11 +6,30 @@ import axios from 'axios';
 // ✅ Import the professional email template
 import { getProfessionalOTPHtml } from '../lib/email-templates/otp-template';
 
+// ─── Fallback simple template (in case the professional import fails) ──
+function getSimpleOTPHtml(otp: string): string {
+  return `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px;">
+  <div style="max-width: 500px; margin: auto; background: #fff; padding: 30px; border-radius: 8px;">
+    <h2 style="color: #333;">Your Refero Code</h2>
+    <div style="background: #f0f0f0; padding: 15px; text-align: center; font-size: 32px; font-weight: bold; letter-spacing: 4px; border-radius: 6px; margin: 20px 0;">
+      ${otp}
+    </div>
+    <p style="color: #666;">This code expires in 5 minutes. If you didn't request it, ignore this email.</p>
+  </div>
+</body>
+</html>
+`;
+}
+
 // ─── Provider Configuration ────────────────────────────────────── 
 const PROVIDERS: Record<string, any> = {
   brevo: {
     name: 'Brevo',
-    url: 'https://api.brevo.com/v3/smtp/email', 
+    url: 'https://api.brevo.com/v3/smtp/email',
     apiKey: process.env.BREVO_API_KEY,
     headers: (key: string) => ({ 
       'api-key': key,  
@@ -42,6 +61,7 @@ const PROVIDERS: Record<string, any> = {
         to,
         subject,
         html,
+        text: `Your OTP code is: ${otp}\nIt expires in 5 minutes.\n\nIf you did not request this, ignore this email.`,
       });
       return params.toString();
     },
@@ -62,6 +82,7 @@ const PROVIDERS: Record<string, any> = {
       to: [to],
       subject,
       html,
+      text: `Your OTP code is: ${otp}\nIt expires in 5 minutes.\n\nIf you did not request this, ignore this email.`,
     }),
     send: async (payload: any, headers: any, url: string) => {
       return await axios.post(url, payload, { headers, timeout: 10000 });
@@ -80,6 +101,7 @@ const PROVIDERS: Record<string, any> = {
       to: [{ email: to }],
       subject: subject,
       html: html,
+      text: `Your OTP code is: ${otp}\nIt expires in 5 minutes.`,
       category: 'OTP Verification',
     }),
     send: async (payload: any, headers: any, url: string) => {
@@ -118,6 +140,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed. Use POST.' });
   }
 
+  // ✅ CHECK: ensure request body exists
+  if (!req.body) {
+    console.error('❌ Request body is missing');
+    return res.status(400).json({ error: 'Request body is missing' });
+  }
+
   // ─── Validate request ─────────────────────────────────────────
   const { email, otp, htmlContent, provider: requestedProvider } = req.body;
 
@@ -154,30 +182,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: 'Failed to find user' });
   }
 
-  // ─── Cooldown: Prevent rapid OTP requests ─────────────────────
-  try {
-    const otpDoc = await db
-      .collection('users')
-      .doc(userId)
-      .collection('otp')
-      .doc('current')
-      .get();
-
-    if (otpDoc.exists) {
-      const data = otpDoc.data();
-      const createdAt = data?.createdAt?.toDate?.() || new Date(0);
-      const seconds = (Date.now() - createdAt.getTime()) / 1000;
-      if (seconds < 5) {
-        console.log(`⏳ Cooldown: ${5 - seconds}s remaining for user ${userId}`);
-        return res.status(429).json({ 
-          error: `Please wait ${Math.ceil(5 - seconds)} seconds before requesting another OTP.` 
-        });
-      }
-    }
-  } catch (error) {
-    console.warn('⚠️ Cooldown check failed:', error);
-    // Continue anyway – don't block on cooldown error
-  }
+  // ─── ❌ Cooldown: REMOVED (no longer restricting) ─────────────
+  // (The cooldown block has been completely removed.)
 
   // ─── Store OTP in Firestore ──────────────────────────────────
   try {
@@ -202,10 +208,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // ─── Send email ──────────────────────────────────────────────
   const fromEmail = process.env.FROM_EMAIL || 'noreply@referoglobal.com';
   const fromName = process.env.FROM_NAME || 'Refero';
-  const subject = '🔐 Your OTP Code for Refero';
+  const subject = 'Your Refero verification code'; // ✅ Removed emoji
 
-  // ✅ Use the professional template – allow override via htmlContent
-  const html = htmlContent || getProfessionalOTPHtml(otp);
+  // ✅ Use professional template with fallback
+  let html = htmlContent;
+  if (!html) {
+    try {
+      html = getProfessionalOTPHtml(otp);
+    } catch (error) {
+      console.error('❌ Professional template failed, using fallback:', error);
+      html = getSimpleOTPHtml(otp);
+    }
+  }
 
   // ─── Get active providers ─────────────────────────────────────
   const activeProviders = Object.keys(PROVIDERS).filter((key) => {
