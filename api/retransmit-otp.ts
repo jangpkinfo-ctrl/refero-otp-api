@@ -34,10 +34,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ message: 'Method not allowed' });
   }
 
+  // ✅ CHECK: ensure request body exists
+  if (!req.body) {
+    console.error('❌ Request body is missing');
+    return res.status(400).json({ message: 'Request body is missing' });
+  }
+
   try {
     const { email } = req.body;
 
     if (!email) {
+      console.error('❌ Email missing in request body');
       return res.status(400).json({ message: 'Email is required' });
     }
 
@@ -79,6 +86,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // ─── Send OTP email using send-otp endpoint ──────────────────
     const otpApiUrl = process.env.NEXT_PUBLIC_OTP_API_URL || 'https://refero-otp-api.vercel.app/api';
+    console.log(`📡 Calling send-otp at: ${otpApiUrl}/send-otp`);
+
     const response = await fetch(`${otpApiUrl}/send-otp`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -88,22 +97,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!response.ok) {
       const errorData = await response.json();
       console.error('❌ OTP send failed:', errorData);
-      return res.status(500).json({ 
+      return res.status(500).json({
         message: 'Failed to send OTP email',
-        details: errorData 
+        details: errorData,
       });
     }
 
-    console.log(`✅ OTP resent to ${email}`);
-    return res.status(200).json({ 
-      success: true, 
-      message: 'OTP resent successfully' 
+    const sendResult = await response.json();
+    console.log(`✅ OTP resent to ${email} via ${sendResult.provider || 'unknown'}`);
+    return res.status(200).json({
+      success: true,
+      message: 'OTP resent successfully',
     });
   } catch (error: any) {
     console.error('❌ Retransmit OTP error:', error);
-    return res.status(500).json({ 
-      message: 'Server error', 
-      details: error.message 
+    return res.status(500).json({
+      message: 'Server error',
+      details: error.message,
     });
   }
 }
