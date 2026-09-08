@@ -10,7 +10,7 @@ import { getProfessionalOTPHtml } from '../lib/email-templates/otp-template';
 const PROVIDERS: Record<string, any> = {
   brevo: {
     name: 'Brevo',
-    url: 'https://api.brevo.com/v3/smtp/email',
+    url: 'https://api.brevo.com/v3/smtp/email', 
     apiKey: process.env.BREVO_API_KEY,
     headers: (key: string) => ({ 
       'api-key': key,  
