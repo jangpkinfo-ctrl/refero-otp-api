@@ -167,10 +167,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const data = otpDoc.data();
       const createdAt = data?.createdAt?.toDate?.() || new Date(0);
       const seconds = (Date.now() - createdAt.getTime()) / 1000;
-      if (seconds < 30) {
-        console.log(`⏳ Cooldown: ${30 - seconds}s remaining for user ${userId}`);
+      if (seconds < 5) {
+        console.log(`⏳ Cooldown: ${5 - seconds}s remaining for user ${userId}`);
         return res.status(429).json({ 
-          error: `Please wait ${Math.ceil(30 - seconds)} seconds before requesting another OTP.` 
+          error: `Please wait ${Math.ceil(5 - seconds)} seconds before requesting another OTP.` 
         });
       }
     }
