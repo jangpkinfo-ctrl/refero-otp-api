@@ -149,16 +149,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // ─── Validate request ─────────────────────────────────────────
   const { email, otp, htmlContent, provider: requestedProvider } = req.body;
 
-  if (!email || !otp) {
-    return res.status(400).json({ error: 'Email and OTP are required' });
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+
+  // ✅ Generate OTP if not provided, else validate the provided one
+  const finalOtp = otp || Math.floor(100000 + Math.random() * 900000).toString();
+
+  if (otp && !/^\d{6}$/.test(otp)) {
+    return res.status(400).json({ error: 'OTP must be a 6-digit number' });
   }
 
   if (!email.includes('@') || !email.includes('.')) {
     return res.status(400).json({ error: 'Invalid email format' });
-  }
-
-  if (!/^\d{6}$/.test(otp)) {
-    return res.status(400).json({ error: 'OTP must be a 6-digit number' });
   }
 
   // ─── Find user by email ──────────────────────────────────────
@@ -182,9 +185,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: 'Failed to find user' });
   }
 
-  // ─── ❌ Cooldown: REMOVED (no longer restricting) ─────────────
-  // (The cooldown block has been completely removed.)
-
   // ─── Store OTP in Firestore ──────────────────────────────────
   try {
     const now = new Date();
@@ -194,7 +194,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       .collection('otp')
       .doc('current')
       .set({
-        code: otp,
+        code: finalOtp,  // ✅ Use the generated or provided OTP
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
         isUsed: false,
@@ -208,16 +208,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // ─── Send email ──────────────────────────────────────────────
   const fromEmail = process.env.FROM_EMAIL || 'noreply@referoglobal.com';
   const fromName = process.env.FROM_NAME || 'Refero';
-  const subject = 'Your Refero verification code'; // ✅ Removed emoji
+  const subject = 'Your Refero verification code';
 
   // ✅ Use professional template with fallback
   let html = htmlContent;
   if (!html) {
     try {
-      html = getProfessionalOTPHtml(otp);
+      html = getProfessionalOTPHtml(finalOtp);
     } catch (error) {
       console.error('❌ Professional template failed, using fallback:', error);
-      html = getSimpleOTPHtml(otp);
+      html = getSimpleOTPHtml(finalOtp);
     }
   }
 
@@ -258,7 +258,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         ? provider.url(provider.domain || '')
         : provider.url;
 
-      const payload = provider.payload(fromEmail, fromName, email, subject, html, otp);
+      const payload = provider.payload(fromEmail, fromName, email, subject, html, finalOtp);
       const headers = provider.headers(provider.apiKey);
 
       const response = await provider.send(payload, headers, url);
