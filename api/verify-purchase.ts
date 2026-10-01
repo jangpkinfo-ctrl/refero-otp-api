@@ -17,13 +17,75 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
 import * as admin from 'firebase-admin';
 
-// ─── Firebase Admin init (once per cold start) ────────────────
+// ═══════════════════════════════════════════════════════════════
+// Firebase Admin init (ROBUST)
+//
+// Handles every common private-key format stored in env vars:
+//   A) Raw PEM with literal \n                → convert to newlines
+//   B) Raw PEM with real newlines             → use as-is
+//   C) Base64-encoded PEM                     → decode, then use
+//   D) Value wrapped in surrounding quotes    → strip, then parse
+//
+// Without this, Firebase Admin throws:
+//   error:1E08010C:DECODER routines::unsupported
+// ═══════════════════════════════════════════════════════════════
+function parseFirebaseKey(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+
+  let key = raw.trim();
+
+  // Strip surrounding quotes if present
+  if (key.startsWith('"') && key.endsWith('"')) {
+    key = key.slice(1, -1).trim();
+  }
+
+  // Case A/B: already a PEM (real newlines OR literal \n)
+  if (key.includes('-----BEGIN')) {
+    if (key.includes('\\n')) {
+      // Literal \n → real newlines
+      return key.replace(/\\n/g, '\n');
+    }
+    return key;
+  }
+
+  // Case C: base64-encoded PEM → decode
+  try {
+    const decoded = Buffer.from(key, 'base64').toString('utf-8');
+    if (decoded.includes('-----BEGIN')) {
+      // Decoded PEM might still have literal \n
+      return decoded.includes('\\n')
+        ? decoded.replace(/\\n/g, '\n')
+        : decoded;
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // Fallback: return as-is (SDK will surface its own error)
+  return key;
+}
+
 if (!admin.apps.length) {
+  const firebaseKey = parseFirebaseKey(process.env.FIREBASE_PRIVATE_KEY);
+
+  console.log(
+    '[verify-purchase] FIREBASE key starts:',
+    firebaseKey?.substring(0, 30),
+  );
+  console.log(
+    '[verify-purchase] FIREBASE key length:',
+    firebaseKey?.length,
+  );
+  console.log(
+    '[verify-purchase] FIREBASE client email:',
+    process.env.FIREBASE_CLIENT_EMAIL,
+  );
+
   admin.initializeApp({
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      privateKey: firebaseKey,
     }),
   });
 }
@@ -31,19 +93,10 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 // ═══════════════════════════════════════════════════════════════
-// Google Play API client
+// Google Play API client (already working — see logs)
 //
 // GOOGLE_SERVICE_ACCOUNT_JSON is base64-encoded JSON.
-// This block:
-//   1. Base64-decodes the env value
-//   2. JSON.parses it
-//   3. Normalizes the private_key to real newlines (critical!)
-//
-// Why step 3 matters:
-//   If the JSON was double-escaped during storage, JSON.parse gives
-//   us a literal "\\n" (backslash + n). OpenSSL needs a real "\n"
-//   (newline) to parse the PEM. Without this fix, googleapis throws:
-//   error:1E08010C:DECODER routines::unsupported
+// Normalizes private_key newlines after decode.
 // ═══════════════════════════════════════════════════════════════
 const serviceAccountJson = (() => {
   const raw = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
@@ -53,7 +106,6 @@ const serviceAccountJson = (() => {
     return {};
   }
 
-  // ─── Step 1 + 2: Decode + parse ─────────────────────────
   let parsed: Record<string, unknown> | null = null;
 
   try {
@@ -61,7 +113,6 @@ const serviceAccountJson = (() => {
     parsed = JSON.parse(decoded);
     console.log('[verify-purchase] SA decoded from base64 OK');
   } catch (b64Err) {
-    // Fallback: maybe the env var is already raw JSON
     try {
       parsed = JSON.parse(raw);
       console.log('[verify-purchase] SA parsed as raw JSON OK');
@@ -77,23 +128,18 @@ const serviceAccountJson = (() => {
 
   if (!parsed) return {};
 
-  // ─── Step 3: Normalize private_key newlines ─────────────
   const pk = parsed.private_key;
   if (typeof pk === 'string') {
-    // Convert any literal "\n" to real newlines
     parsed.private_key = pk.replace(/\\n/g, '\n');
     console.log(
-      '[verify-purchase] private_key starts:',
+      '[verify-purchase] Play SA private_key starts:',
       (parsed.private_key as string).substring(0, 30),
     );
   } else {
-    console.error('[verify-purchase] private_key missing or not a string');
+    console.error('[verify-purchase] Play SA private_key missing');
   }
 
-  console.log(
-    '[verify-purchase] SA client_email:',
-    parsed.client_email,
-  );
+  console.log('[verify-purchase] Play SA client_email:', parsed.client_email);
 
   return parsed;
 })();
@@ -108,7 +154,8 @@ const androidPublisher = google.androidpublisher({
   auth,
 });
 
-const PACKAGE_NAME = process.env.ANDROID_PACKAGE_NAME || 'com.refero.userapp';
+const PACKAGE_NAME =
+  process.env.ANDROID_PACKAGE_NAME || 'com.refero.userapp';
 
 // ─── Plan catalog (must mirror lib/models/plan_model.dart) ────
 interface PlanMeta {
@@ -121,9 +168,15 @@ const PLAN_CATALOG: Record<string, PlanMeta> = {
   refero_bronze: { tier: 'bronze', networkDepth: 3, pricePkr: 1500 },
   refero_silver: { tier: 'silver', networkDepth: 6, pricePkr: 3000 },
   refero_gold:   { tier: 'gold',   networkDepth: 10, pricePkr: 5000 },
-  refero_bronze_lifetime: { tier: 'bronze', networkDepth: 3, pricePkr: 45000 },
-  refero_silver_lifetime: { tier: 'silver', networkDepth: 6, pricePkr: 90000 },
-  refero_gold_lifetime:   { tier: 'gold',   networkDepth: 10, pricePkr: 120000 },
+  refero_bronze_lifetime: {
+    tier: 'bronze', networkDepth: 3, pricePkr: 45000,
+  },
+  refero_silver_lifetime: {
+    tier: 'silver', networkDepth: 6, pricePkr: 90000,
+  },
+  refero_gold_lifetime: {
+    tier: 'gold',   networkDepth: 10, pricePkr: 120000,
+  },
 };
 
 // ─── Utilities ────────────────────────────────────────────────
@@ -194,10 +247,11 @@ export default async function handler(
     let googleStartTime: Date | null = null;
 
     if (isSubscription) {
-      const response = await androidPublisher.purchases.subscriptionsv2.get({
-        packageName: PACKAGE_NAME,
-        token: purchaseToken,
-      });
+      const response =
+        await androidPublisher.purchases.subscriptionsv2.get({
+          packageName: PACKAGE_NAME,
+          token: purchaseToken,
+        });
 
       const sub = response.data;
 
@@ -218,9 +272,12 @@ export default async function handler(
       }
 
       basePlanId = lineItem.offerDetails?.basePlanId || null;
-      expiryTime = lineItem.expiryTime ? new Date(lineItem.expiryTime) : null;
+      expiryTime = lineItem.expiryTime
+        ? new Date(lineItem.expiryTime)
+        : null;
       googleStartTime = sub.startTime ? new Date(sub.startTime) : null;
-      autoRenewing = lineItem.autoRenewingPlan?.autoRenewEnabled ?? false;
+      autoRenewing =
+        lineItem.autoRenewingPlan?.autoRenewEnabled ?? false;
 
       orderId =
         (sub as { latestOrderId?: string | null }).latestOrderId || '';
