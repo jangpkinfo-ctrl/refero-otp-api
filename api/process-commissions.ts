@@ -5,7 +5,7 @@
 // ✅ Production-grade, high-concurrency safe, Vercel-optimized
 // ✅ Fully typed — no implicit any
 //
-// Body: { userId, subscriptionId, productId, amount }
+// Body: { userId, subscriptionId, productId, amount } 
 //
 // Behavior:
 //   • Direct referrer (level 1) gets 20%
