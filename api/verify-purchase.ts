@@ -7,7 +7,7 @@
 // Flow:
 //   1. Verify purchase with Google Play Developer API
 //   2. Check for duplicate (idempotency)
-//   3. Determine plan type (subscription vs one-time) 
+//   3. Determine plan type (subscription vs one-time)
 //   4. Compute subscription dates
 //   5. Update user doc + create subscription doc (atomic)
 //   6. Fire-and-forget: trigger commission processing
@@ -30,32 +30,72 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
-// ─── Google Play API client ───────────────────────────────────
-// ✅ FIX: GOOGLE_SERVICE_ACCOUNT_JSON is base64-encoded JSON
-//         (base64 avoids \n corruption in Vercel UI)
-//         This block decodes it safely, with raw JSON fallback.
+// ═══════════════════════════════════════════════════════════════
+// Google Play API client
+//
+// GOOGLE_SERVICE_ACCOUNT_JSON is base64-encoded JSON.
+// This block:
+//   1. Base64-decodes the env value
+//   2. JSON.parses it
+//   3. Normalizes the private_key to real newlines (critical!)
+//
+// Why step 3 matters:
+//   If the JSON was double-escaped during storage, JSON.parse gives
+//   us a literal "\\n" (backslash + n). OpenSSL needs a real "\n"
+//   (newline) to parse the PEM. Without this fix, googleapis throws:
+//   error:1E08010C:DECODER routines::unsupported
+// ═══════════════════════════════════════════════════════════════
 const serviceAccountJson = (() => {
-  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '';
+  const raw = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
+
   if (!raw) {
     console.error('[verify-purchase] GOOGLE_SERVICE_ACCOUNT_JSON is empty');
     return {};
   }
+
+  // ─── Step 1 + 2: Decode + parse ─────────────────────────
+  let parsed: Record<string, unknown> | null = null;
+
   try {
-    // Try base64 decode first
     const decoded = Buffer.from(raw, 'base64').toString('utf-8');
-    return JSON.parse(decoded);
-  } catch {
-    // Fallback: already raw JSON
+    parsed = JSON.parse(decoded);
+    console.log('[verify-purchase] SA decoded from base64 OK');
+  } catch (b64Err) {
+    // Fallback: maybe the env var is already raw JSON
     try {
-      return JSON.parse(raw);
-    } catch (e) {
+      parsed = JSON.parse(raw);
+      console.log('[verify-purchase] SA parsed as raw JSON OK');
+    } catch (jsonErr) {
       console.error(
-        '[verify-purchase] Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON:',
-        e,
+        '[verify-purchase] Failed to parse SA:',
+        b64Err,
+        jsonErr,
       );
       return {};
     }
   }
+
+  if (!parsed) return {};
+
+  // ─── Step 3: Normalize private_key newlines ─────────────
+  const pk = parsed.private_key;
+  if (typeof pk === 'string') {
+    // Convert any literal "\n" to real newlines
+    parsed.private_key = pk.replace(/\\n/g, '\n');
+    console.log(
+      '[verify-purchase] private_key starts:',
+      (parsed.private_key as string).substring(0, 30),
+    );
+  } else {
+    console.error('[verify-purchase] private_key missing or not a string');
+  }
+
+  console.log(
+    '[verify-purchase] SA client_email:',
+    parsed.client_email,
+  );
+
+  return parsed;
 })();
 
 const auth = new google.auth.GoogleAuth({
