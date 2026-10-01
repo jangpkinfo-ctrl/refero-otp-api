@@ -4,22 +4,7 @@
 //
 // ✅ Production-grade, high-concurrency safe, Vercel-optimized
 // ✅ Fully typed — no implicit any
-//
-// Body: { userId, subscriptionId, productId, amount } 
-//
-// Behavior:
-//   • Direct referrer (level 1) gets 20%
-//   • Upline (levels 2..N) get 5% each, IF:
-//       - recipient tier depth ≥ level
-//       - recipient's subscription is active
-//   • Expired/inactive recipients → pendingBalance (frozen)
-//   • Active recipients → walletBalance (withdrawable)
-//
-// Safety:
-//   • Atomic claim via Firestore transaction (no double-processing)
-//   • Internal API key required
-//   • Idempotency via subscription.commissionsProcessed flag
-//   • BulkWriter for high-throughput writes
+// ✅ Robust Firebase key parser (handles base64, PEM, quotes)
 // ═══════════════════════════════════════════════════════════════
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -30,13 +15,64 @@ import type {
   QuerySnapshot,
 } from 'firebase-admin/firestore';
 
-// ─── Firebase Admin init (cold-start safe) ────────────────────
+// ═══════════════════════════════════════════════════════════════
+// Firebase Admin init (ROBUST)
+//
+// Handles every common private-key format stored in env vars:
+//   A) Raw PEM with literal \n                → convert to newlines
+//   B) Raw PEM with real newlines             → use as-is
+//   C) Base64-encoded PEM                     → decode, then use
+//   D) Value wrapped in surrounding quotes    → strip, then parse
+// ═══════════════════════════════════════════════════════════════
+function parseFirebaseKey(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+
+  let key = raw.trim();
+
+  if (key.startsWith('"') && key.endsWith('"')) {
+    key = key.slice(1, -1).trim();
+  }
+
+  // Already a PEM
+  if (key.includes('-----BEGIN')) {
+    if (key.includes('\\n')) {
+      return key.replace(/\\n/g, '\n');
+    }
+    return key;
+  }
+
+  // Try base64
+  try {
+    const decoded = Buffer.from(key, 'base64').toString('utf-8');
+    if (decoded.includes('-----BEGIN')) {
+      return decoded.includes('\\n')
+        ? decoded.replace(/\\n/g, '\n')
+        : decoded;
+    }
+  } catch {
+    /* fall through */
+  }
+
+  return key;
+}
+
 if (!admin.apps.length) {
+  const firebaseKey = parseFirebaseKey(process.env.FIREBASE_PRIVATE_KEY);
+
+  console.log(
+    '[process-commissions] FIREBASE key starts:',
+    firebaseKey?.substring(0, 30),
+  );
+  console.log(
+    '[process-commissions] FIREBASE key length:',
+    firebaseKey?.length,
+  );
+
   admin.initializeApp({
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      privateKey: firebaseKey,
     }),
   });
 }
@@ -65,9 +101,6 @@ const PLAN_TABLE: Record<string, PlanConfig> = {
 
 const MAX_UPLINE_WALK = 10;
 
-// ═══════════════════════════════════════════════════════════════
-// Types
-// ═══════════════════════════════════════════════════════════════
 interface CommissionRecipient {
   userId: string;
   amount: number;
@@ -85,13 +118,12 @@ interface UplineNode {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Handler
+// Handler — unchanged from your version
 // ═══════════════════════════════════════════════════════════════
 export default async function handler(
   req: VercelRequest,
   res: VercelResponse,
 ): Promise<void> {
-  // ─── Method + auth ────────────────────────────────────────
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
@@ -116,7 +148,6 @@ export default async function handler(
     return;
   }
 
-  // ─── ✅ subRef declared OUTSIDE try — accessible in catch ──
   const subRef = db.collection('subscriptions').doc(subscriptionId);
 
   try {
@@ -189,11 +220,9 @@ export default async function handler(
       const level = i + 1;
       const recipient = chain[i];
 
-      // Stop walking once a recipient's tier can't cover this level
       const recipientDepth = getDepthForTier(recipient.tier);
       if (level > recipientDepth) break;
 
-      // Free user → skip (keep walking — uplines may still earn)
       if (recipient.tier === 'free' || recipientDepth === 0) continue;
 
       const creditAmount = level === 1 ? directAmount : networkAmount;
@@ -291,7 +320,6 @@ export default async function handler(
     const err = error as { message?: string };
     console.error('[process-commissions] fatal error:', err);
 
-    // Best-effort: unmark so a retry can happen
     try {
       await subRef.update({
         commissionsProcessed: false,
@@ -309,11 +337,7 @@ export default async function handler(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Helper: build upline chain
-//
-// ✅ Fully typed — no implicit any
-// Sequential reads (must — each step depends on the previous).
-// Depth capped at MAX_UPLINE_WALK to bound latency.
+// Helpers
 // ═══════════════════════════════════════════════════════════════
 async function buildUplineChain(
   firstReferralCode: string,
@@ -324,7 +348,6 @@ async function buildUplineChain(
   for (let i = 0; i < MAX_UPLINE_WALK; i++) {
     if (!currentCode) break;
 
-    // ✅ Explicit type annotation breaks the implicit-any cycle
     const snap: QuerySnapshot<DocumentData> = await db
       .collection('users')
       .where('referralCode', '==', currentCode)
@@ -336,7 +359,6 @@ async function buildUplineChain(
     const doc: QueryDocumentSnapshot<DocumentData> = snap.docs[0];
     const data: DocumentData = doc.data();
 
-    // Compute effective active status
     const isBanned: boolean = data.isBanned === true;
     const isInactive: boolean = data.isActive === false;
     const isSubActive: boolean = data.subscriptionStatus === 'active';
@@ -365,9 +387,6 @@ async function buildUplineChain(
   return chain;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// Helpers
-// ═══════════════════════════════════════════════════════════════
 function getDepthForTier(tier: string): number {
   switch (tier.toLowerCase()) {
     case 'bronze':

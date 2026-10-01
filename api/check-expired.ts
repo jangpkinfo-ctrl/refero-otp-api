@@ -1,6 +1,6 @@
 // api/cron/check-expired.ts
 // ═══════════════════════════════════════════════════════════════
-// GET /api/cron/check-expired (Vercel Cron)
+// GET /api/check-expired (Vercel Cron)
 //
 // Runs daily at midnight UTC.
 //
@@ -14,12 +14,73 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import * as admin from 'firebase-admin';
 
+// ═══════════════════════════════════════════════════════════════
+// Firebase Admin init (ROBUST)
+//
+// Handles every common private-key format stored in env vars:
+//   A) Raw PEM with literal \n                → convert to newlines
+//   B) Raw PEM with real newlines             → use as-is
+//   C) Base64-encoded PEM                     → decode, then use
+//   D) Value wrapped in surrounding quotes    → strip, then parse
+//
+// Without this, Firebase Admin throws:
+//   error:1E08010C:DECODER routines::unsupported
+// ═══════════════════════════════════════════════════════════════
+function parseFirebaseKey(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+
+  let key = raw.trim();
+
+  // Strip surrounding quotes if present
+  if (key.startsWith('"') && key.endsWith('"')) {
+    key = key.slice(1, -1).trim();
+  }
+
+  // Case A/B: already a PEM (real newlines OR literal \n)
+  if (key.includes('-----BEGIN')) {
+    if (key.includes('\\n')) {
+      return key.replace(/\\n/g, '\n');
+    }
+    return key;
+  }
+
+  // Case C: base64-encoded PEM → decode
+  try {
+    const decoded = Buffer.from(key, 'base64').toString('utf-8');
+    if (decoded.includes('-----BEGIN')) {
+      return decoded.includes('\\n')
+        ? decoded.replace(/\\n/g, '\n')
+        : decoded;
+    }
+  } catch {
+    /* fall through */
+  }
+
+  // Fallback: return as-is (SDK will surface its own error)
+  return key;
+}
+
 if (!admin.apps.length) {
+  const firebaseKey = parseFirebaseKey(process.env.FIREBASE_PRIVATE_KEY);
+
+  console.log(
+    '[cron/check-expired] FIREBASE key starts:',
+    firebaseKey?.substring(0, 30),
+  );
+  console.log(
+    '[cron/check-expired] FIREBASE key length:',
+    firebaseKey?.length,
+  );
+  console.log(
+    '[cron/check-expired] FIREBASE client email:',
+    process.env.FIREBASE_CLIENT_EMAIL,
+  );
+
   admin.initializeApp({
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      privateKey: firebaseKey,
     }),
   });
 }
@@ -28,13 +89,17 @@ const db = admin.firestore();
 
 const FORFEIT_DAYS = 90;
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(
+  req: VercelRequest,
+  res: VercelResponse,
+): Promise<void> {
   // ─── Verify cron secret ──────────────────────────────────
   const authHeader = req.headers.authorization || '';
   const expectedSecret = `Bearer ${process.env.CRON_SECRET}`;
 
   if (authHeader !== expectedSecret) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
   }
 
   const now = new Date();
@@ -51,8 +116,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const expiredQuery = await db
       .collection('users')
       .where('subscriptionStatus', '==', 'active')
-      .where('subscriptionEndDate', '<', admin.firestore.Timestamp.fromDate(now))
-      .limit(500) // batch cap
+      .where(
+        'subscriptionEndDate',
+        '<',
+        admin.firestore.Timestamp.fromDate(now),
+      )
+      .limit(500)
       .get();
 
     if (!expiredQuery.empty) {
@@ -61,7 +130,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       for (const doc of expiredQuery.docs) {
         const data = doc.data();
 
-        // Skip lifetime users (should never happen, but safety)
+        // Skip lifetime users (safety)
         if (data.planDuration === 'lifetime') continue;
 
         batch.update(doc.ref, {
@@ -87,8 +156,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const forfeitQuery = await db
       .collection('users')
       .where('subscriptionStatus', '==', 'expired')
-      .where('subscriptionExpiredAt', '<',
-             admin.firestore.Timestamp.fromDate(forfeitThreshold))
+      .where(
+        'subscriptionExpiredAt',
+        '<',
+        admin.firestore.Timestamp.fromDate(forfeitThreshold),
+      )
       .where('pendingBalance', '>', 0)
       .limit(500)
       .get();
@@ -121,16 +193,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await batch.commit();
     }
 
-    return res.status(200).json({
+    res.status(200).json({
       success: true,
       ranAt: now.toISOString(),
       ...result,
     });
-  } catch (error: any) {
-    console.error('[cron/check-expired] error:', error);
-    return res.status(500).json({
+  } catch (error: unknown) {
+    const err = error as { message?: string };
+    console.error('[cron/check-expired] error:', err);
+
+    res.status(500).json({
       success: false,
-      error: error?.message || 'Cron failed',
+      error: err?.message || 'Cron failed',
       ...result,
     });
   }
