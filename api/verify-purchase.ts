@@ -31,8 +31,35 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 // ─── Google Play API client ───────────────────────────────────
+// ✅ FIX: GOOGLE_SERVICE_ACCOUNT_JSON is base64-encoded JSON
+//         (base64 avoids \n corruption in Vercel UI)
+//         This block decodes it safely, with raw JSON fallback.
+const serviceAccountJson = (() => {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '';
+  if (!raw) {
+    console.error('[verify-purchase] GOOGLE_SERVICE_ACCOUNT_JSON is empty');
+    return {};
+  }
+  try {
+    // Try base64 decode first
+    const decoded = Buffer.from(raw, 'base64').toString('utf-8');
+    return JSON.parse(decoded);
+  } catch {
+    // Fallback: already raw JSON
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      console.error(
+        '[verify-purchase] Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON:',
+        e,
+      );
+      return {};
+    }
+  }
+})();
+
 const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}'),
+  credentials: serviceAccountJson,
   scopes: ['https://www.googleapis.com/auth/androidpublisher'],
 });
 
@@ -51,11 +78,9 @@ interface PlanMeta {
 }
 
 const PLAN_CATALOG: Record<string, PlanMeta> = {
-  // Subscriptions
   refero_bronze: { tier: 'bronze', networkDepth: 3, pricePkr: 1500 },
   refero_silver: { tier: 'silver', networkDepth: 6, pricePkr: 3000 },
   refero_gold:   { tier: 'gold',   networkDepth: 10, pricePkr: 5000 },
-  // Lifetime one-time
   refero_bronze_lifetime: { tier: 'bronze', networkDepth: 3, pricePkr: 45000 },
   refero_silver_lifetime: { tier: 'silver', networkDepth: 6, pricePkr: 90000 },
   refero_gold_lifetime:   { tier: 'gold',   networkDepth: 10, pricePkr: 120000 },
@@ -88,7 +113,6 @@ export default async function handler(
 
   const { userId, productId, purchaseToken } = req.body || {};
 
-  // ─── Validate inputs ──────────────────────────────────────
   if (!userId || !productId || !purchaseToken) {
     res.status(400).json({
       error: 'Missing required fields: userId, productId, purchaseToken',
@@ -130,7 +154,6 @@ export default async function handler(
     let googleStartTime: Date | null = null;
 
     if (isSubscription) {
-      // Subscriptions v2 API
       const response = await androidPublisher.purchases.subscriptionsv2.get({
         packageName: PACKAGE_NAME,
         token: purchaseToken,
@@ -138,7 +161,6 @@ export default async function handler(
 
       const sub = response.data;
 
-      // Validate state
       if (
         sub.subscriptionState !== 'SUBSCRIPTION_STATE_ACTIVE' &&
         sub.subscriptionState !== 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD'
@@ -160,13 +182,9 @@ export default async function handler(
       googleStartTime = sub.startTime ? new Date(sub.startTime) : null;
       autoRenewing = lineItem.autoRenewingPlan?.autoRenewEnabled ?? false;
 
-      // ✅ FIX: latestOrderId exists in Google's runtime API but is missing
-      //         from the shipped TypeScript types in googleapis@140+.
-      //         Narrow cast — safe, one-off.
       orderId =
         (sub as { latestOrderId?: string | null }).latestOrderId || '';
     } else {
-      // One-time product API
       const response = await androidPublisher.purchases.products.get({
         packageName: PACKAGE_NAME,
         productId,
@@ -186,7 +204,6 @@ export default async function handler(
       googleStartTime = product.purchaseTimeMillis
         ? new Date(parseInt(product.purchaseTimeMillis, 10))
         : new Date();
-      // Lifetime: no expiry
       expiryTime = null;
     }
 
@@ -252,8 +269,6 @@ export default async function handler(
     await batch.commit();
 
     // ─── STEP 5: Fire commission processing (non-blocking) ──
-    // ✅ Response goes out FIRST → no added latency for the client
-    // ✅ Vercel keeps the function alive briefly to let fetch complete
     const baseUrl =
       process.env.API_BASE_URL || `https://${req.headers.host}`;
 
@@ -283,7 +298,6 @@ export default async function handler(
   } catch (error: unknown) {
     console.error('[verify-purchase] error:', error);
 
-    // Google Play API errors surface here
     const err = error as {
       response?: { data?: { error?: { message?: string } } };
       message?: string;
