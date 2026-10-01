@@ -7,7 +7,7 @@
 // Flow:
 //   1. Verify purchase with Google Play Developer API
 //   2. Check for duplicate (idempotency)
-//   3. Determine plan type (subscription vs one-time)
+//   3. Determine plan type (subscription vs one-time) 
 //   4. Compute subscription dates
 //   5. Update user doc + create subscription doc (atomic)
 //   6. Fire-and-forget: trigger commission processing
