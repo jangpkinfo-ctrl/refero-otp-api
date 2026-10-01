@@ -1,7 +1,7 @@
 // ─── Professional OTP Email Template ──────────────────────────
 export function getProfessionalOTPHtml(otp: string): string {
   const year = new Date().getFullYear();
-  // ✅ Update these URLs to your actual values
+  // ✅ Use your actual logo URL
   const logoUrl = 'https://www.referoglobal.com/logo_with_name.png';
   const websiteUrl = 'https://www.referoglobal.com';
   const termsUrl = 'https://www.referoglobal.com/terms';
@@ -22,13 +22,13 @@ export function getProfessionalOTPHtml(otp: string): string {
               <!-- ─── Main Container ─── -->
               <table width="600" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius:16px; box-shadow:0 4px 24px rgba(0,0,0,0.06); overflow:hidden; max-width:600px; width:100%;">
                 
-                <!-- ─── Header with Logo ─── -->
+                <!-- ─── Header with Logo (Neutral Dark Banner) ─── -->
                 <tr>
-                  <td style="background: linear-gradient(135deg, #6C63FF, #5a52d5); padding:28px 30px; text-align:center;">
+                  <td style="background: linear-gradient(135deg, #1a1a2e, #2d2d44); padding:28px 30px; text-align:center;">
                     <a href="${websiteUrl}" target="_blank" style="text-decoration:none; display:inline-block;">
-                      <img src="${logoUrl}" alt="Refero" style="height:44px; max-width:220px; filter: brightness(0) invert(1);" />
+                      <img src="${logoUrl}" alt="Refero" style="height:44px; max-width:220px; display:block; margin:0 auto;" />
                     </a>
-                    <p style="color:rgba(255,255,255,0.8); font-size:13px; margin:6px 0 0 0; letter-spacing:0.3px;">
+                    <p style="color:rgba(255,255,255,0.6); font-size:13px; margin:8px 0 0 0; letter-spacing:0.3px; font-weight:300;">
                       Build your referral network &amp; earn commissions
                     </p>
                   </td>
