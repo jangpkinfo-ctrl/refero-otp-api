@@ -1,4 +1,4 @@
-// api/cron/check-expired.ts
+// api/check-expired.ts
 // ═══════════════════════════════════════════════════════════════
 // GET /api/check-expired (Vercel Cron)
 //
@@ -9,6 +9,11 @@
 //   2. Find users with subscriptionEndDate < now && status == active
 //   3. Mark them expired + disable canRefer/canEarnTasks
 //   4. Forfeit pendingBalance if expired > 90 days
+//
+// Firestore constraint note:
+//   A single query cannot have range filters on multiple fields.
+//   PHASE 2 therefore queries on subscriptionExpiredAt only, and
+//   filters pendingBalance > 0 in application code.
 // ═══════════════════════════════════════════════════════════════
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -64,15 +69,15 @@ if (!admin.apps.length) {
   const firebaseKey = parseFirebaseKey(process.env.FIREBASE_PRIVATE_KEY);
 
   console.log(
-    '[cron/check-expired] FIREBASE key starts:',
+    '[check-expired] FIREBASE key starts:',
     firebaseKey?.substring(0, 30),
   );
   console.log(
-    '[cron/check-expired] FIREBASE key length:',
+    '[check-expired] FIREBASE key length:',
     firebaseKey?.length,
   );
   console.log(
-    '[cron/check-expired] FIREBASE client email:',
+    '[check-expired] FIREBASE client email:',
     process.env.FIREBASE_CLIENT_EMAIL,
   );
 
@@ -112,6 +117,13 @@ export default async function handler(
   try {
     // ═══════════════════════════════════════════════════════
     // PHASE 1: Expire active subscriptions past their end date
+    //
+    // Query uses TWO fields with a range on ONE of them:
+    //   subscriptionStatus == 'active'   (equality)
+    //   subscriptionEndDate < now         (range)
+    //
+    // Requires composite index:
+    //   users: subscriptionStatus (ASC), subscriptionEndDate (ASC)
     // ═══════════════════════════════════════════════════════
     const expiredQuery = await db
       .collection('users')
@@ -149,27 +161,40 @@ export default async function handler(
 
     // ═══════════════════════════════════════════════════════
     // PHASE 2: Forfeit pendingBalance after 90 days
+    //
+    // ✅ FIX: Query uses ONLY ONE range filter:
+    //     subscriptionExpiredAt < forfeitThreshold
+    //   The 'pendingBalance > 0' check is done in code below.
+    //
+    // Requires single-field index (or auto-created):
+    //   users: subscriptionExpiredAt (ASC)
     // ═══════════════════════════════════════════════════════
     const forfeitThreshold = new Date(now);
     forfeitThreshold.setDate(forfeitThreshold.getDate() - FORFEIT_DAYS);
 
     const forfeitQuery = await db
       .collection('users')
-      .where('subscriptionStatus', '==', 'expired')
       .where(
         'subscriptionExpiredAt',
         '<',
         admin.firestore.Timestamp.fromDate(forfeitThreshold),
       )
-      .where('pendingBalance', '>', 0)
       .limit(500)
       .get();
 
     if (!forfeitQuery.empty) {
       const batch = db.batch();
+      let batchOps = 0;
 
       for (const doc of forfeitQuery.docs) {
-        const pending = doc.data().pendingBalance || 0;
+        const data = doc.data();
+        const pending = data.pendingBalance || 0;
+
+        // ✅ Filter in code (Firestore can't filter on 2 ranges)
+        if (pending <= 0) continue;
+
+        // Extra safety: only forfeit users marked as expired
+        if (data.subscriptionStatus !== 'expired') continue;
 
         batch.update(doc.ref, {
           pendingBalance: 0,
@@ -188,9 +213,15 @@ export default async function handler(
         });
 
         result.forfeited++;
+        batchOps += 2; // update + log
+
+        // Firestore batch limit is 500 ops — stay safe
+        if (batchOps >= 480) break;
       }
 
-      await batch.commit();
+      if (batchOps > 0) {
+        await batch.commit();
+      }
     }
 
     res.status(200).json({
@@ -200,7 +231,7 @@ export default async function handler(
     });
   } catch (error: unknown) {
     const err = error as { message?: string };
-    console.error('[cron/check-expired] error:', err);
+    console.error('[check-expired] error:', err);
 
     res.status(500).json({
       success: false,
