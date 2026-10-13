@@ -3,7 +3,7 @@
 // POST /api/verify-purchase
 //
 // Body: { userId, productId, purchaseToken }
-//
+// 
 // Flow:
 //   1. Verify purchase with Google Play Developer API
 //   2. Check for duplicate (idempotency)
