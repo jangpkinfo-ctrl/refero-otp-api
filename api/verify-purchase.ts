@@ -341,6 +341,8 @@ export default async function handler(
       googlePlayOrderId: orderId,
       googlePlayAutoRenewing: autoRenewing,
       subscriptionExpiredAt: null,
+      pendingSubscription: null,
+      pendingPlanId: null, 
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
