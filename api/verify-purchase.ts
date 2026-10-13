@@ -157,7 +157,10 @@ const androidPublisher = google.androidpublisher({
 const PACKAGE_NAME =
   process.env.ANDROID_PACKAGE_NAME || 'com.refero.userapp';
 
-// ─── Plan catalog (must mirror lib/models/plan_model.dart) ────
+// ═══════════════════════════════════════════════════════════════
+// Plan catalog (UPDATED TO YEARLY ONLY)
+// Must mirror lib/models/plan_model.dart
+// ═══════════════════════════════════════════════════════════════
 interface PlanMeta {
   tier: 'bronze' | 'silver' | 'gold';
   networkDepth: number;
@@ -165,18 +168,9 @@ interface PlanMeta {
 }
 
 const PLAN_CATALOG: Record<string, PlanMeta> = {
-  refero_bronze: { tier: 'bronze', networkDepth: 3, pricePkr: 1500 },
+  refero_bronze: { tier: 'bronze', networkDepth: 3, pricePkr: 2000 },
   refero_silver: { tier: 'silver', networkDepth: 6, pricePkr: 3000 },
-  refero_gold:   { tier: 'gold',   networkDepth: 10, pricePkr: 5000 },
-  refero_bronze_lifetime: {
-    tier: 'bronze', networkDepth: 3, pricePkr: 45000,
-  },
-  refero_silver_lifetime: {
-    tier: 'silver', networkDepth: 6, pricePkr: 90000,
-  },
-  refero_gold_lifetime: {
-    tier: 'gold',   networkDepth: 10, pricePkr: 120000,
-  },
+  refero_gold:   { tier: 'gold',   networkDepth: 10, pricePkr: 4000 },
 };
 
 // ─── Utilities ────────────────────────────────────────────────
@@ -219,7 +213,8 @@ export default async function handler(
     return;
   }
 
-  const isSubscription = !productId.endsWith('_lifetime');
+  // Treat everything as a subscription since we removed lifetime plans
+  const isSubscription = true;
 
   try {
     // ─── STEP 1: Idempotency check ──────────────────────────
@@ -246,82 +241,54 @@ export default async function handler(
     let basePlanId: string | null = null;
     let googleStartTime: Date | null = null;
 
-    if (isSubscription) {
-      const response =
-        await androidPublisher.purchases.subscriptionsv2.get({
-          packageName: PACKAGE_NAME,
-          token: purchaseToken,
-        });
-
-      const sub = response.data;
-
-      if (
-        sub.subscriptionState !== 'SUBSCRIPTION_STATE_ACTIVE' &&
-        sub.subscriptionState !== 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD'
-      ) {
-        res.status(400).json({
-          error: `Subscription not active: ${sub.subscriptionState}`,
-        });
-        return;
-      }
-
-      const lineItem = sub.lineItems?.[0];
-      if (!lineItem) {
-        res.status(400).json({ error: 'No line items in subscription' });
-        return;
-      }
-
-      basePlanId = lineItem.offerDetails?.basePlanId || null;
-      expiryTime = lineItem.expiryTime
-        ? new Date(lineItem.expiryTime)
-        : null;
-      googleStartTime = sub.startTime ? new Date(sub.startTime) : null;
-      autoRenewing =
-        lineItem.autoRenewingPlan?.autoRenewEnabled ?? false;
-
-      orderId =
-        (sub as { latestOrderId?: string | null }).latestOrderId || '';
-    } else {
-      const response = await androidPublisher.purchases.products.get({
+    // Subscriptions v2 API
+    const response =
+      await androidPublisher.purchases.subscriptionsv2.get({
         packageName: PACKAGE_NAME,
-        productId,
         token: purchaseToken,
       });
 
-      const product = response.data;
+    const sub = response.data;
 
-      if (product.purchaseState !== 0) {
-        res.status(400).json({
-          error: `Product not purchased. State: ${product.purchaseState}`,
-        });
-        return;
-      }
-
-      orderId = product.orderId || '';
-      googleStartTime = product.purchaseTimeMillis
-        ? new Date(parseInt(product.purchaseTimeMillis, 10))
-        : new Date();
-      expiryTime = null;
+    if (
+      sub.subscriptionState !== 'SUBSCRIPTION_STATE_ACTIVE' &&
+      sub.subscriptionState !== 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD'
+    ) {
+      res.status(400).json({
+        error: `Subscription not active: ${sub.subscriptionState}`,
+      });
+      return;
     }
+
+    const lineItem = sub.lineItems?.[0];
+    if (!lineItem) {
+      res.status(400).json({ error: 'No line items in subscription' });
+      return;
+    }
+
+    basePlanId = lineItem.offerDetails?.basePlanId || null;
+    expiryTime = lineItem.expiryTime
+      ? new Date(lineItem.expiryTime)
+      : null;
+    googleStartTime = sub.startTime ? new Date(sub.startTime) : null;
+    autoRenewing =
+      lineItem.autoRenewingPlan?.autoRenewEnabled ?? false;
+
+    orderId =
+      (sub as { latestOrderId?: string | null }).latestOrderId || '';
 
     // ─── STEP 3: Compute effective dates ────────────────────
     const now = new Date();
     let subscriptionEndDate: Date | null = expiryTime;
     let planDuration: string;
 
-    if (isSubscription) {
-      if (basePlanId === 'monthly') {
-        planDuration = 'monthly';
-        if (!subscriptionEndDate) subscriptionEndDate = addMonths(now, 1);
-      } else if (basePlanId === 'yearly') {
-        planDuration = 'yearly';
-        if (!subscriptionEndDate) subscriptionEndDate = addYears(now, 1);
-      } else {
-        planDuration = basePlanId || 'monthly';
-      }
+    if (basePlanId === 'monthly') {
+      planDuration = 'monthly';
+      if (!subscriptionEndDate) subscriptionEndDate = addMonths(now, 1);
     } else {
-      planDuration = 'lifetime';
-      subscriptionEndDate = null;
+      // Default to yearly for our new plans
+      planDuration = 'yearly';
+      if (!subscriptionEndDate) subscriptionEndDate = addYears(now, 1);
     }
 
     // ─── STEP 4: Atomic Firestore update ────────────────────
@@ -342,7 +309,9 @@ export default async function handler(
       googlePlayAutoRenewing: autoRenewing,
       subscriptionExpiredAt: null,
       pendingSubscription: null,
-      pendingPlanId: null, 
+      pendingPlanId: null,
+      canRefer: true,                  // ✅ UNLOCK REFERRALS
+      canEarnTasks: true,              // ✅ UNLOCK TASKS
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 

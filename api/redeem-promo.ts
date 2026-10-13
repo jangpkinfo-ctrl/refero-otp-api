@@ -87,6 +87,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       subscriptionEndDate: endDate,
       pendingSubscription: null,
       pendingPlanId: null,
+      subscriptionExpiredAt: null,     // ✅ CLEAR EXPIRY
+      canRefer: true,                  // ✅ UNLOCK REFERRALS
+      canEarnTasks: true,              // ✅ UNLOCK TASKS
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
