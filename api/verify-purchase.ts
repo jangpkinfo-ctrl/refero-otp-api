@@ -1,146 +1,46 @@
 // api/verify-purchase.ts
-// ═══════════════════════════════════════════════════════════════
-// POST /api/verify-purchase
-//
-// Body: { userId, productId, purchaseToken }
-// 
-// Flow:
-//   1. Verify purchase with Google Play Developer API
-//   2. Check for duplicate (idempotency)
-//   3. Determine plan type (subscription vs one-time)
-//   4. Compute subscription dates
-//   5. Update user doc + create subscription doc (atomic)
-//   6. Fire-and-forget: trigger commission processing
-// ═══════════════════════════════════════════════════════════════
-
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
 import * as admin from 'firebase-admin';
 
-// ═══════════════════════════════════════════════════════════════
-// Firebase Admin init (ROBUST)
-//
-// Handles every common private-key format stored in env vars:
-//   A) Raw PEM with literal \n                → convert to newlines
-//   B) Raw PEM with real newlines             → use as-is
-//   C) Base64-encoded PEM                     → decode, then use
-//   D) Value wrapped in surrounding quotes    → strip, then parse
-//
-// Without this, Firebase Admin throws:
-//   error:1E08010C:DECODER routines::unsupported
-// ═══════════════════════════════════════════════════════════════
+// ─── Firebase Admin init (ROBUST) ─────────────────────────────
 function parseFirebaseKey(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
-
   let key = raw.trim();
-
-  // Strip surrounding quotes if present
-  if (key.startsWith('"') && key.endsWith('"')) {
-    key = key.slice(1, -1).trim();
-  }
-
-  // Case A/B: already a PEM (real newlines OR literal \n)
-  if (key.includes('-----BEGIN')) {
-    if (key.includes('\\n')) {
-      // Literal \n → real newlines
-      return key.replace(/\\n/g, '\n');
-    }
-    return key;
-  }
-
-  // Case C: base64-encoded PEM → decode
+  if (key.startsWith('"') && key.endsWith('"')) key = key.slice(1, -1).trim();
+  if (key.includes('-----BEGIN')) return key.includes('\\n') ? key.replace(/\\n/g, '\n') : key;
   try {
     const decoded = Buffer.from(key, 'base64').toString('utf-8');
-    if (decoded.includes('-----BEGIN')) {
-      // Decoded PEM might still have literal \n
-      return decoded.includes('\\n')
-        ? decoded.replace(/\\n/g, '\n')
-        : decoded;
-    }
-  } catch {
-    /* fall through */
-  }
-
-  // Fallback: return as-is (SDK will surface its own error)
+    if (decoded.includes('-----BEGIN')) return decoded.includes('\\n') ? decoded.replace(/\\n/g, '\n') : decoded;
+  } catch { /* fall through */ }
   return key;
 }
 
 if (!admin.apps.length) {
-  const firebaseKey = parseFirebaseKey(process.env.FIREBASE_PRIVATE_KEY);
-
-  console.log(
-    '[verify-purchase] FIREBASE key starts:',
-    firebaseKey?.substring(0, 30),
-  );
-  console.log(
-    '[verify-purchase] FIREBASE key length:',
-    firebaseKey?.length,
-  );
-  console.log(
-    '[verify-purchase] FIREBASE client email:',
-    process.env.FIREBASE_CLIENT_EMAIL,
-  );
-
   admin.initializeApp({
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: firebaseKey,
+      privateKey: parseFirebaseKey(process.env.FIREBASE_PRIVATE_KEY),
     }),
   });
 }
 
 const db = admin.firestore();
 
-// ═══════════════════════════════════════════════════════════════
-// Google Play API client (already working — see logs)
-//
-// GOOGLE_SERVICE_ACCOUNT_JSON is base64-encoded JSON.
-// Normalizes private_key newlines after decode.
-// ═══════════════════════════════════════════════════════════════
+// ─── Google Play API client ───────────────────────────────────
 const serviceAccountJson = (() => {
   const raw = (process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
-
-  if (!raw) {
-    console.error('[verify-purchase] GOOGLE_SERVICE_ACCOUNT_JSON is empty');
-    return {};
-  }
-
-  let parsed: Record<string, unknown> | null = null;
-
+  if (!raw) return {};
+  let parsed: Record<string, any> | null = null;
   try {
     const decoded = Buffer.from(raw, 'base64').toString('utf-8');
     parsed = JSON.parse(decoded);
-    console.log('[verify-purchase] SA decoded from base64 OK');
-  } catch (b64Err) {
-    try {
-      parsed = JSON.parse(raw);
-      console.log('[verify-purchase] SA parsed as raw JSON OK');
-    } catch (jsonErr) {
-      console.error(
-        '[verify-purchase] Failed to parse SA:',
-        b64Err,
-        jsonErr,
-      );
-      return {};
-    }
+  } catch { 
+    try { parsed = JSON.parse(raw); } catch { return {}; }
   }
-
   if (!parsed) return {};
-
-  const pk = parsed.private_key;
-  if (typeof pk === 'string') {
-    parsed.private_key = pk.replace(/\\n/g, '\n');
-    console.log(
-      '[verify-purchase] Play SA private_key starts:',
-      (parsed.private_key as string).substring(0, 30),
-    );
-  } else {
-    console.error('[verify-purchase] Play SA private_key missing');
-  }
-
-  console.log('[verify-purchase] Play SA client_email:', parsed.client_email);
-
+  if (typeof parsed.private_key === 'string') parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
   return parsed;
 })();
 
@@ -149,18 +49,10 @@ const auth = new google.auth.GoogleAuth({
   scopes: ['https://www.googleapis.com/auth/androidpublisher'],
 });
 
-const androidPublisher = google.androidpublisher({
-  version: 'v3',
-  auth,
-});
+const androidPublisher = google.androidpublisher({ version: 'v3', auth });
+const PACKAGE_NAME = process.env.ANDROID_PACKAGE_NAME || 'com.refero.userapp';
 
-const PACKAGE_NAME =
-  process.env.ANDROID_PACKAGE_NAME || 'com.refero.userapp';
-
-// ═══════════════════════════════════════════════════════════════
-// Plan catalog (UPDATED TO YEARLY ONLY)
-// Must mirror lib/models/plan_model.dart
-// ═══════════════════════════════════════════════════════════════
+// ─── Plan catalog ─────────────────────────────────────────────
 interface PlanMeta {
   tier: 'bronze' | 'silver' | 'gold';
   networkDepth: number;
@@ -173,13 +65,6 @@ const PLAN_CATALOG: Record<string, PlanMeta> = {
   refero_gold:   { tier: 'gold',   networkDepth: 10, pricePkr: 4000 },
 };
 
-// ─── Utilities ────────────────────────────────────────────────
-function addMonths(date: Date, months: number): Date {
-  const d = new Date(date);
-  d.setMonth(d.getMonth() + months);
-  return d;
-}
-
 function addYears(date: Date, years: number): Date {
   const d = new Date(date);
   d.setFullYear(d.getFullYear() + years);
@@ -189,10 +74,7 @@ function addYears(date: Date, years: number): Date {
 // ═══════════════════════════════════════════════════════════════
 // Handler
 // ═══════════════════════════════════════════════════════════════
-export default async function handler(
-  req: VercelRequest,
-  res: VercelResponse,
-): Promise<void> {
+export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
@@ -201,9 +83,7 @@ export default async function handler(
   const { userId, productId, purchaseToken } = req.body || {};
 
   if (!userId || !productId || !purchaseToken) {
-    res.status(400).json({
-      error: 'Missing required fields: userId, productId, purchaseToken',
-    });
+    res.status(400).json({ error: 'Missing required fields' });
     return;
   }
 
@@ -213,50 +93,27 @@ export default async function handler(
     return;
   }
 
-  // Treat everything as a subscription since we removed lifetime plans
-  const isSubscription = true;
-
   try {
-    // ─── STEP 1: Idempotency check ──────────────────────────
-    const existingQuery = await db
-      .collection('subscriptions')
-      .where('purchaseToken', '==', purchaseToken)
-      .limit(1)
-      .get();
-
+    // 1. Idempotency Check
+    const existingQuery = await db.collection('subscriptions').where('purchaseToken', '==', purchaseToken).limit(1).get();
     if (!existingQuery.empty) {
-      const existing = existingQuery.docs[0];
-      res.status(200).json({
-        success: true,
-        status: 'already_verified',
-        subscriptionId: existing.id,
-      });
+      res.status(200).json({ success: true, status: 'already_verified', subscriptionId: existingQuery.docs[0].id });
       return;
     }
 
-    // ─── STEP 2: Verify with Google Play ────────────────────
-    let expiryTime: Date | null = null;
-    let autoRenewing = false;
-    let orderId = '';
-    let basePlanId: string | null = null;
-    let googleStartTime: Date | null = null;
+    // ✅ 2. Check if this is a RENEWAL (User already has a subscription)
+    const previousSubs = await db.collection('subscriptions').where('userId', '==', userId).limit(1).get();
+    const isFirstPurchase = previousSubs.empty;
 
-    // Subscriptions v2 API
-    const response =
-      await androidPublisher.purchases.subscriptionsv2.get({
-        packageName: PACKAGE_NAME,
-        token: purchaseToken,
-      });
+    // 3. Verify with Google Play
+    const response = await androidPublisher.purchases.subscriptionsv2.get({
+      packageName: PACKAGE_NAME,
+      token: purchaseToken,
+    });
 
     const sub = response.data;
-
-    if (
-      sub.subscriptionState !== 'SUBSCRIPTION_STATE_ACTIVE' &&
-      sub.subscriptionState !== 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD'
-    ) {
-      res.status(400).json({
-        error: `Subscription not active: ${sub.subscriptionState}`,
-      });
+    if (sub.subscriptionState !== 'SUBSCRIPTION_STATE_ACTIVE' && sub.subscriptionState !== 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD') {
+      res.status(400).json({ error: `Subscription not active: ${sub.subscriptionState}` });
       return;
     }
 
@@ -266,43 +123,22 @@ export default async function handler(
       return;
     }
 
-    basePlanId = lineItem.offerDetails?.basePlanId || null;
-    expiryTime = lineItem.expiryTime
-      ? new Date(lineItem.expiryTime)
-      : null;
-    googleStartTime = sub.startTime ? new Date(sub.startTime) : null;
-    autoRenewing =
-      lineItem.autoRenewingPlan?.autoRenewEnabled ?? false;
+    const expiryTime = lineItem.expiryTime ? new Date(lineItem.expiryTime) : addYears(new Date(), 1);
+    const googleStartTime = sub.startTime ? new Date(sub.startTime) : new Date();
+    const orderId = (sub as any).latestOrderId || '';
+    const autoRenewing = lineItem.autoRenewingPlan?.autoRenewEnabled ?? false;
 
-    orderId =
-      (sub as { latestOrderId?: string | null }).latestOrderId || '';
-
-    // ─── STEP 3: Compute effective dates ────────────────────
-    const now = new Date();
-    let subscriptionEndDate: Date | null = expiryTime;
-    let planDuration: string;
-
-    if (basePlanId === 'monthly') {
-      planDuration = 'monthly';
-      if (!subscriptionEndDate) subscriptionEndDate = addMonths(now, 1);
-    } else {
-      // Default to yearly for our new plans
-      planDuration = 'yearly';
-      if (!subscriptionEndDate) subscriptionEndDate = addYears(now, 1);
-    }
-
-    // ─── STEP 4: Atomic Firestore update ────────────────────
+    // 4. Atomic Firestore update
     const batch = db.batch();
-
     const userRef = db.collection('users').doc(userId);
     const subscriptionRef = db.collection('subscriptions').doc();
 
     batch.update(userRef, {
       tier: planMeta.tier,
       subscriptionStatus: 'active',
-      planDuration,
-      subscriptionStartDate: googleStartTime || now,
-      subscriptionEndDate,
+      planDuration: 'yearly',
+      subscriptionStartDate: googleStartTime,
+      subscriptionEndDate: expiryTime,
       googlePlayPurchaseToken: purchaseToken,
       googlePlayProductId: productId,
       googlePlayOrderId: orderId,
@@ -310,75 +146,51 @@ export default async function handler(
       subscriptionExpiredAt: null,
       pendingSubscription: null,
       pendingPlanId: null,
-      canRefer: true,                  // ✅ UNLOCK REFERRALS
-      canEarnTasks: true,              // ✅ UNLOCK TASKS
+      canRefer: true,
+      canEarnTasks: true,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     batch.set(subscriptionRef, {
       userId,
       productId,
-      basePlanId,
       tier: planMeta.tier,
-      duration: planDuration,
       amount: planMeta.pricePkr,
       paymentMethod: 'google_play',
       purchaseToken,
       orderId,
       autoRenewing,
       status: 'active',
-      startDate: googleStartTime || now,
-      endDate: subscriptionEndDate,
-      commissionsProcessed: false,
+      startDate: googleStartTime,
+      endDate: expiryTime,
+      // ✅ Mark as processed if renewal (prevents double commissions)
+      commissionsProcessed: !isFirstPurchase, 
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     await batch.commit();
 
-    // ─── STEP 5: Fire commission processing (non-blocking) ──
-    const baseUrl =
-      process.env.API_BASE_URL || `https://${req.headers.host}`;
-
-    fetch(`${baseUrl}/api/process-commissions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Internal-Key': process.env.INTERNAL_API_KEY || '',
-      },
-      body: JSON.stringify({
-        userId,
-        subscriptionId: subscriptionRef.id,
-        productId,
-        amount: planMeta.pricePkr,
-      }),
-    }).catch((err) => {
-      console.error('[verify-purchase] commission trigger failed:', err);
-    });
+    // ✅ 5. Trigger commissions ONLY on first purchase
+    if (isFirstPurchase) {
+      console.log(`[verify-purchase] First purchase. Triggering commissions.`);
+      const baseUrl = process.env.API_BASE_URL || `https://${req.headers.host}`;
+      fetch(`${baseUrl}/api/process-commissions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Internal-Key': process.env.INTERNAL_API_KEY || '' },
+        body: JSON.stringify({ userId, subscriptionId: subscriptionRef.id, productId, amount: planMeta.pricePkr }),
+      }).catch((err) => console.error('[verify-purchase] commission trigger failed:', err));
+    } else {
+      console.log(`[verify-purchase] Renewal detected. Skipping commissions.`);
+    }
 
     res.status(200).json({
       success: true,
       subscriptionId: subscriptionRef.id,
       tier: planMeta.tier,
-      duration: planDuration,
-      endDate: subscriptionEndDate?.toISOString() || null,
+      endDate: expiryTime.toISOString(),
     });
-  } catch (error: unknown) {
+  } catch (error: any) {
     console.error('[verify-purchase] error:', error);
-
-    const err = error as {
-      response?: { data?: { error?: { message?: string } } };
-      message?: string;
-    };
-
-    const message =
-      err?.response?.data?.error?.message ||
-      err?.message ||
-      'Verification failed';
-
-    res.status(500).json({
-      success: false,
-      error: message,
-    });
+    res.status(500).json({ success: false, error: error?.message || 'Verification failed' });
   }
 }
