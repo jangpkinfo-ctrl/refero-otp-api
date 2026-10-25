@@ -1,70 +1,31 @@
 // api/process-commissions.ts
 // ═══════════════════════════════════════════════════════════════
 // POST /api/process-commissions (internal only)
-//
-// ✅ Production-grade, high-concurrency safe, Vercel-optimized
-// ✅ Fully typed — no implicit any
-// ✅ Robust Firebase key parser (handles base64, PEM, quotes)
 // ═══════════════════════════════════════════════════════════════
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import * as admin from 'firebase-admin';
-import type {
-  DocumentData,
-  QueryDocumentSnapshot,
-  QuerySnapshot,
-} from 'firebase-admin/firestore';
+import type { DocumentData, QuerySnapshot } from 'firebase-admin/firestore';
 
-// ═══════════════════════════════════════════════════════════════
-// Firebase Admin init (ROBUST)
-// ═══════════════════════════════════════════════════════════════
+// ─── Firebase Admin init (ROBUST) ─────────────────────────────
 function parseFirebaseKey(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
-
   let key = raw.trim();
-
-  if (key.startsWith('"') && key.endsWith('"')) {
-    key = key.slice(1, -1).trim();
-  }
-
-  if (key.includes('-----BEGIN')) {
-    if (key.includes('\\n')) {
-      return key.replace(/\\n/g, '\n');
-    }
-    return key;
-  }
-
+  if (key.startsWith('"') && key.endsWith('"')) key = key.slice(1, -1).trim();
+  if (key.includes('-----BEGIN')) return key.includes('\\n') ? key.replace(/\\n/g, '\n') : key;
   try {
     const decoded = Buffer.from(key, 'base64').toString('utf-8');
-    if (decoded.includes('-----BEGIN')) {
-      return decoded.includes('\\n')
-        ? decoded.replace(/\\n/g, '\n')
-        : decoded;
-    }
-  } catch {
-    /* fall through */
-  }
-
+    if (decoded.includes('-----BEGIN')) return decoded.includes('\\n') ? decoded.replace(/\\n/g, '\n') : decoded;
+  } catch { /* fall through */ }
   return key;
 }
 
 if (!admin.apps.length) {
-  const firebaseKey = parseFirebaseKey(process.env.FIREBASE_PRIVATE_KEY);
-
-  console.log(
-    '[process-commissions] FIREBASE key starts:',
-    firebaseKey?.substring(0, 30),
-  );
-  console.log(
-    '[process-commissions] FIREBASE key length:',
-    firebaseKey?.length,
-  );
-
   admin.initializeApp({
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: firebaseKey,
+      privateKey: parseFirebaseKey(process.env.FIREBASE_PRIVATE_KEY),
     }),
   });
 }
@@ -72,23 +33,24 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 // ═══════════════════════════════════════════════════════════════
-// Plan configuration (UPDATED TO YEARLY ONLY)
+// Plan configuration
 // ═══════════════════════════════════════════════════════════════
 interface PlanConfig {
   tier: 'bronze' | 'silver' | 'gold';
-  depth: number;
+  maxIndirects: number; 
   directPct: number;
   networkPct: number;
   pricePkr: number;
 }
 
 const PLAN_TABLE: Record<string, PlanConfig> = {
-  refero_bronze: { tier: 'bronze', depth: 3, directPct: 20, networkPct: 5, pricePkr: 2000 },
-  refero_silver: { tier: 'silver', depth: 6, directPct: 20, networkPct: 5, pricePkr: 3000 },
-  refero_gold:   { tier: 'gold',   depth: 10, directPct: 20, networkPct: 5, pricePkr: 4000 },
+  refero_bronze: { tier: 'bronze', maxIndirects: 3, directPct: 20, networkPct: 5, pricePkr: 2000 },
+  refero_silver: { tier: 'silver', maxIndirects: 6, directPct: 20, networkPct: 5, pricePkr: 3000 },
+  refero_gold:   { tier: 'gold',   maxIndirects: 10, directPct: 20, networkPct: 5, pricePkr: 4000 },
 };
 
-const MAX_UPLINE_WALK = 10;
+// ✅ HARD CAP: We only ever walk 2 levels up (Direct + Indirect)
+const MAX_UPLINE_WALK = 2; 
 
 interface CommissionRecipient {
   userId: string;
@@ -109,23 +71,19 @@ interface UplineNode {
 // ═══════════════════════════════════════════════════════════════
 // Handler
 // ═══════════════════════════════════════════════════════════════
-export default async function handler(
-  req: VercelRequest,
-  res: VercelResponse,
-): Promise<void> {
+export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
+  // ✅ FIX: Split res.status and return to satisfy Promise<void>
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
-
-  const providedKey = req.headers['x-internal-key'];
-  if (!providedKey || providedKey !== process.env.INTERNAL_API_KEY) {
+  
+  if (req.headers['x-internal-key'] !== process.env.INTERNAL_API_KEY) {
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
   const { userId, subscriptionId, productId, amount } = req.body || {};
-
   if (!userId || !subscriptionId || typeof amount !== 'number' || amount <= 0) {
     res.status(400).json({ error: 'Invalid payload' });
     return;
@@ -140,9 +98,9 @@ export default async function handler(
   const subRef = db.collection('subscriptions').doc(subscriptionId);
 
   try {
-    // ═══════════════════════════════════════════════════════
-    // STEP 1: Atomic claim (idempotency + concurrency guard)
-    // ═══════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    // STEP 1: Atomic Claim (Idempotency & Concurrency Guard)
+    // ═══════════════════════════════════════════════════════════
     const claimed: boolean = await db.runTransaction(async (tx) => {
       const subDoc = await tx.get(subRef);
       if (!subDoc.exists) return false;
@@ -161,88 +119,89 @@ export default async function handler(
       return;
     }
 
-    // ═══════════════════════════════════════════════════════
-    // STEP 2: Fetch trigger user
-    // ═══════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    // STEP 2: Fetch Trigger User & Validate Data
+    // ═══════════════════════════════════════════════════════════
     const triggerUserDoc = await db.collection('users').doc(userId).get();
     if (!triggerUserDoc.exists) {
       res.status(200).json({ status: 'user_not_found' });
       return;
     }
-    const triggerUser: DocumentData = triggerUserDoc.data()!;
-    const triggerName: string = triggerUser.fullName || 'Someone';
+    
+    const triggerUser = triggerUserDoc.data()!;
+    const triggerName = triggerUser.fullName || 'Someone';
+    const buyerReferralIndex = Number(triggerUser.referralIndex) || 0; 
 
     if (!triggerUser.referredBy) {
-      await subRef.update({
-        commissionsDistributed: 0,
-        commissionsRecipients: 0,
-        commissionsReason: 'no_referrer',
-      });
+      await subRef.update({ commissionsDistributed: 0, commissionsReason: 'no_referrer' });
       res.status(200).json({ status: 'no_referrer' });
       return;
     }
 
-    // ═══════════════════════════════════════════════════════
-    // STEP 3: Walk upline chain
-    // ═══════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    // STEP 3: Build Upline Chain (Max 2 Levels)
+    // ═══════════════════════════════════════════════════════════
     const chain: UplineNode[] = await buildUplineChain(triggerUser.referredBy);
 
     if (chain.length === 0) {
-      await subRef.update({
-        commissionsDistributed: 0,
-        commissionsRecipients: 0,
-        commissionsReason: 'no_upline',
-      });
+      await subRef.update({ commissionsDistributed: 0, commissionsReason: 'no_upline' });
       res.status(200).json({ status: 'no_upline' });
       return;
     }
 
-    // ═══════════════════════════════════════════════════════
-    // STEP 4: Compute credits
-    // ═══════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    // STEP 4: Compute Credits (with 2-Level & Quantity Caps)
+    // ═══════════════════════════════════════════════════════════
     const directAmount = (amount * planConfig.directPct) / 100;
     const networkAmount = (amount * planConfig.networkPct) / 100;
-
     const credits: CommissionRecipient[] = [];
 
     for (let i = 0; i < chain.length; i++) {
-      const level = i + 1;
+      const level = i + 1; // 1 = Direct Referrer, 2 = Indirect Referrer
       const recipient = chain[i];
 
-      const recipientDepth = getDepthForTier(recipient.tier);
-      if (level > recipientDepth) break;
+      // Skip free users entirely
+      if (recipient.tier === 'free') continue;
 
-      if (recipient.tier === 'free' || recipientDepth === 0) continue;
+      let creditAmount = 0;
 
-      const creditAmount = level === 1 ? directAmount : networkAmount;
+      if (level === 1) {
+        // Level 1: Direct always gets paid
+        creditAmount = directAmount;
+      } else if (level === 2) {
+        // Level 2: Indirect gets paid ONLY if the quantity cap allows it
+        const maxAllowed = getMaxIndirectsForTier(recipient.tier);
+        
+        if (buyerReferralIndex > maxAllowed) {
+          console.log(`⛔ Level 2 blocked: Buyer index (${buyerReferralIndex}) > ${recipient.tier} cap (${maxAllowed}).`);
+          continue; 
+        }
+        creditAmount = networkAmount;
+      }
 
       credits.push({
         userId: recipient.userId,
         amount: creditAmount,
         type: level === 1 ? 'direct' : 'network',
         level,
-        frozen: !recipient.isActive, // ✅ Handles expired users
+        frozen: !recipient.isActive, 
         tier: recipient.tier,
       });
     }
 
     if (credits.length === 0) {
-      await subRef.update({
-        commissionsDistributed: 0,
-        commissionsRecipients: 0,
-        commissionsReason: 'no_eligible_recipients',
-      });
+      await subRef.update({ commissionsDistributed: 0, commissionsReason: 'no_eligible_recipients' });
       res.status(200).json({ status: 'no_eligible_recipients' });
       return;
     }
 
-    // ═══════════════════════════════════════════════════════
-    // STEP 5: Bulk write
-    // ═══════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
+    // STEP 5: Bulk Write
+    // ═══════════════════════════════════════════════════════════
     const bulkWriter = db.bulkWriter();
     bulkWriter.onWriteError((error) => {
       console.error('[bulkWriter] write error:', error.message);
-      return error.failedAttempts < 3;
+      return error.failedAttempts < 3; 
     });
 
     const timestamp = admin.firestore.FieldValue.serverTimestamp();
@@ -252,7 +211,6 @@ export default async function handler(
     for (const credit of credits) {
       const userRef = db.collection('users').doc(credit.userId);
 
-      // ✅ ROUTING LOGIC: Pending vs Wallet
       if (credit.frozen) {
         bulkWriter.update(userRef, {
           pendingBalance: admin.firestore.FieldValue.increment(credit.amount),
@@ -277,10 +235,9 @@ export default async function handler(
         planName,
         productId,
         frozen: credit.frozen,
-        description:
-          credit.type === 'direct'
-            ? `Direct commission (${planConfig.directPct}%) from ${triggerName}'s ${planName}`
-            : `Indirect commission (${planConfig.networkPct}%) from ${triggerName} (level ${credit.level})`,
+        description: credit.type === 'direct'
+          ? `Direct commission (${planConfig.directPct}%) from ${triggerName}'s ${planName}`
+          : `Indirect commission (${planConfig.networkPct}%) from ${triggerName} (Level 2)`,
         timestamp,
       });
 
@@ -289,9 +246,9 @@ export default async function handler(
 
     await bulkWriter.close();
 
-    // ═══════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
     // STEP 6: Finalize
-    // ═══════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════
     await subRef.update({
       commissionsDistributed: totalDistributed,
       commissionsRecipients: credits.length,
@@ -306,6 +263,8 @@ export default async function handler(
       frozen: credits.filter((c) => c.frozen).length,
       details: credits,
     });
+    return;
+
   } catch (error: unknown) {
     const err = error as { message?: string };
     console.error('[process-commissions] fatal error:', err);
@@ -315,50 +274,41 @@ export default async function handler(
         commissionsProcessed: false,
         commissionsError: err?.message || 'unknown',
       });
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
 
-    res.status(500).json({
-      success: false,
-      error: err?.message || 'Commission processing failed',
-    });
+    res.status(500).json({ success: false, error: err?.message || 'Commission processing failed' });
+    return;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════
-async function buildUplineChain(
-  firstReferralCode: string,
-): Promise<UplineNode[]> {
+
+async function buildUplineChain(firstReferralCode: string): Promise<UplineNode[]> {
   const chain: UplineNode[] = [];
   let currentCode: string | null = firstReferralCode;
 
   for (let i = 0; i < MAX_UPLINE_WALK; i++) {
     if (!currentCode) break;
 
-    const snap: QuerySnapshot<DocumentData> = await db
-      .collection('users')
+    const snap: QuerySnapshot<DocumentData> = await db.collection('users')
       .where('referralCode', '==', currentCode)
       .limit(1)
       .get();
 
     if (snap.empty) break;
 
-    const doc: QueryDocumentSnapshot<DocumentData> = snap.docs[0];
-    const data: DocumentData = doc.data();
+    const doc = snap.docs[0];
+    const data = doc.data();
 
-    // ✅ Determine active access (this drives the frozen logic)
-    const isBanned: boolean = data.isBanned === true;
-    const isInactive: boolean = data.isActive === false;
-    const isSubActive: boolean = data.subscriptionStatus === 'active';
+    const isBanned = data.isBanned === true;
+    const isInactive = data.isActive === false;
+    const isSubActive = data.subscriptionStatus === 'active';
     
     let hasActiveAccess = false;
-    
     if (!isBanned && !isInactive && isSubActive) {
-      const endDate: Date | undefined = data.subscriptionEndDate?.toDate?.();
-      // If subscriptionEndDate exists, check if it's in the future
+      const endDate = data.subscriptionEndDate?.toDate?.();
       hasActiveAccess = !endDate || endDate > new Date();
     }
 
@@ -375,7 +325,7 @@ async function buildUplineChain(
   return chain;
 }
 
-function getDepthForTier(tier: string): number {
+function getMaxIndirectsForTier(tier: string): number {
   switch (tier.toLowerCase()) {
     case 'bronze': return 3;
     case 'silver': return 6;
