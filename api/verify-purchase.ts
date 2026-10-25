@@ -1,4 +1,3 @@
-// api/verify-purchase.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { google } from 'googleapis';
 import * as admin from 'firebase-admin';
@@ -81,8 +80,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
   }
 
   const { userId, productId, purchaseToken } = req.body || {};
+  const uid = String(userId);
 
-  if (!userId || !productId || !purchaseToken) {
+  if (!uid || uid === 'undefined' || !productId || !purchaseToken) {
     res.status(400).json({ error: 'Missing required fields' });
     return;
   }
@@ -101,8 +101,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       return;
     }
 
-    // ✅ 2. Check if this is a RENEWAL (User already has a subscription)
-    const previousSubs = await db.collection('subscriptions').where('userId', '==', userId).limit(1).get();
+    // 2. Check if this is a RENEWAL
+    const previousSubs = await db.collection('subscriptions').where('userId', '==', uid).limit(1).get();
     const isFirstPurchase = previousSubs.empty;
 
     // 3. Verify with Google Play
@@ -128,12 +128,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
     const orderId = (sub as any).latestOrderId || '';
     const autoRenewing = lineItem.autoRenewingPlan?.autoRenewEnabled ?? false;
 
-    // 4. Atomic Firestore update
-    const batch = db.batch();
-    const userRef = db.collection('users').doc(userId);
+    // 4. Check for Frozen Funds to Unlock
+    const userRef = db.collection('users').doc(uid);
     const subscriptionRef = db.collection('subscriptions').doc();
+    
+    const userDoc = await userRef.get();
+    const currentPending = userDoc.data()?.pendingBalance || 0;
 
-    batch.update(userRef, {
+    // 5. Atomic Firestore Update
+    const batch = db.batch();
+
+    const userUpdate: any = {
       tier: planMeta.tier,
       subscriptionStatus: 'active',
       planDuration: 'yearly',
@@ -149,10 +154,27 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       canRefer: true,
       canEarnTasks: true,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    };
+
+    // ✅ MOVE FROZEN FUNDS TO WALLET ON RENEWAL
+    if (currentPending > 0) {
+      userUpdate.walletBalance = admin.firestore.FieldValue.increment(currentPending);
+      userUpdate.pendingBalance = 0; // Clear pending balance
+      
+      // Log the unlock
+      const historyRef = userRef.collection('earningsHistory').doc();
+      batch.set(historyRef, {
+        type: 'unlock',
+        amount: currentPending,
+        description: 'Unlocked frozen commissions on renewal',
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+
+    batch.update(userRef, userUpdate);
 
     batch.set(subscriptionRef, {
-      userId,
+      userId: uid,
       productId,
       tier: planMeta.tier,
       amount: planMeta.pricePkr,
@@ -163,21 +185,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       status: 'active',
       startDate: googleStartTime,
       endDate: expiryTime,
-      // ✅ Mark as processed if renewal (prevents double commissions)
       commissionsProcessed: !isFirstPurchase, 
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     await batch.commit();
 
-    // ✅ 5. Trigger commissions ONLY on first purchase
+    // 6. Trigger Commissions ONLY on first purchase
     if (isFirstPurchase) {
       console.log(`[verify-purchase] First purchase. Triggering commissions.`);
       const baseUrl = process.env.API_BASE_URL || `https://${req.headers.host}`;
       fetch(`${baseUrl}/api/process-commissions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Internal-Key': process.env.INTERNAL_API_KEY || '' },
-        body: JSON.stringify({ userId, subscriptionId: subscriptionRef.id, productId, amount: planMeta.pricePkr }),
+        body: JSON.stringify({ userId: uid, subscriptionId: subscriptionRef.id, productId, amount: planMeta.pricePkr }),
       }).catch((err) => console.error('[verify-purchase] commission trigger failed:', err));
     } else {
       console.log(`[verify-purchase] Renewal detected. Skipping commissions.`);
